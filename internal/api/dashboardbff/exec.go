@@ -16,8 +16,15 @@ const (
 	maxBytes      = 100 << 10 // default per-call stdout cap (100 KB)
 	maxConcurrent = 4         // simultaneous subprocesses
 
-	gitLogTimeout   = 10 * time.Second
-	bdDoctorTimeout = 15 * time.Second
+	gitLogTimeout = 10 * time.Second
+	// bd doctor's Orphaned Dependencies check runs an unindexable
+	// COALESCE-join over dependencies x issues; on a large rig (gcas:
+	// ~15k deps, ~16k issues) the full doctor takes ~21s, which blew the
+	// previous 15s budget and made the health panel report "probe failed:
+	// exec timed out" instead of the rig's actual state. The probe runs on
+	// a 5-minute cadence, so a 60s ceiling is cheap (30s proved too thin under sampler+order contention); the query itself is
+	// tracked for an upstream fix.
+	bdDoctorTimeout = 60 * time.Second
 	gitLogRecentN   = "200"
 )
 
