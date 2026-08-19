@@ -51,13 +51,26 @@ func TestBDVersionPins(t *testing.T) {
 	// The native Go store, the bleeding-edge contract-matrix cell, and the
 	// source-built agent image must all use the same upstream commit. A drift
 	// here can pair one schema catalog with another version's write behavior.
+	// Two pin shapes are accepted: a pseudo-version (unreleased commit), whose
+	// embedded 12-char SHA must prefix-match BD_CURRENT_REF; or a release tag
+	// (the current cell IS a published release, e.g. the v1.2.2 recovery
+	// release, gc-kjk3l), which must equal BD_CURRENT_VERSION exactly —
+	// BD_CURRENT_REF then names that tag's commit, which the Dockerfile check
+	// below still anchors.
 	goMod := readFile(t, root, "go.mod")
-	goModMatch := regexp.MustCompile(`(?m)^\s*github\.com/steveyegge/beads\s+v\S+-([0-9a-f]{12})\s*$`).FindStringSubmatch(goMod)
-	if goModMatch == nil {
-		t.Fatal("go.mod missing a pseudo-version pin for github.com/steveyegge/beads")
-	}
-	if got, want := goModMatch[1], bdCurrentRef[:12]; got != want {
-		t.Fatalf("go.mod beads pseudo-version commit = %q, want BD_CURRENT_REF prefix %q", got, want)
+	goModPseudo := regexp.MustCompile(`(?m)^\s*github\.com/steveyegge/beads\s+v\S+-([0-9a-f]{12})\s*$`).FindStringSubmatch(goMod)
+	goModRelease := regexp.MustCompile(`(?m)^\s*github\.com/steveyegge/beads\s+(v\d+\.\d+\.\d+)\s*$`).FindStringSubmatch(goMod)
+	switch {
+	case goModPseudo != nil:
+		if got, want := goModPseudo[1], bdCurrentRef[:12]; got != want {
+			t.Fatalf("go.mod beads pseudo-version commit = %q, want BD_CURRENT_REF prefix %q", got, want)
+		}
+	case goModRelease != nil:
+		if got, want := goModRelease[1], bdCurrent; got != want {
+			t.Fatalf("go.mod beads release pin = %q, want BD_CURRENT_VERSION %q", got, want)
+		}
+	default:
+		t.Fatal("go.mod missing a pseudo-version or release pin for github.com/steveyegge/beads")
 	}
 	dockerfile := readFile(t, root, "contrib/k8s/Dockerfile.agent")
 	if !strings.Contains(dockerfile, "ARG BD_SOURCE_REF="+bdCurrentRef) {

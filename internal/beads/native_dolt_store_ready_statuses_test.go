@@ -2,35 +2,27 @@ package beads
 
 import (
 	"context"
-	"reflect"
 	"testing"
 
 	beadslib "github.com/steveyegge/beads"
 )
 
 // workFilterMatchesStatus mirrors the backing store's status selection for
-// GetReadyWork spies: Statuses carries the whole open-class set with OR
-// semantics, and singular Status remains honored for callers that still set
-// it. Spies that key off filter.Status alone silently match nothing once
-// Ready() moved to the single multi-status query.
+// GetReadyWork spies. With the embedded beads dependency pinned to v1.2.2
+// (gc-kjk3l) WorkFilter carries only the singular Status field, so Ready()
+// issues one call per open-class status and each spy call matches exactly
+// that status.
 func workFilterMatchesStatus(filter beadslib.WorkFilter, status beadslib.Status) bool {
-	if filter.Status != "" {
-		return status == filter.Status
-	}
-	for _, s := range filter.Statuses {
-		if status == s {
-			return true
-		}
-	}
-	return false
+	return status == filter.Status
 }
 
-// Ready must fetch all open-class backing statuses in ONE GetReadyWork call
-// (WorkFilter.Statuses) instead of one call per status: each backing call
-// re-pays the deferred-parents pre-query, the wisp arm, and the transaction
-// round trips (sr-5rz: ~30-70ms per call on a live server-mode store, ~7x
-// per Ready()).
-func TestNativeDoltStoreReadySingleBackingCallWithAllStatuses(t *testing.T) {
+// Ready pays one GetReadyWork call per open-class backing status: the v1.2.2
+// (tested 1.1-line) WorkFilter has no Statuses field, so the single-call
+// multi-status shape (sr-5rz) is unavailable until the dependency moves
+// forward onto a tested post-sr-5rz release. This test pins the loop shape:
+// every status in nativeDoltOpenReadyStatuses is queried exactly once, and
+// rows returned for multiple statuses dedupe to one bead.
+func TestNativeDoltStoreReadyOneBackingCallPerStatus(t *testing.T) {
 	var calls []beadslib.WorkFilter
 	storage := &nativeDoltStorageSpy{
 		getReadyWork: func(_ context.Context, filter beadslib.WorkFilter) ([]*beadslib.Issue, error) {
@@ -47,23 +39,23 @@ func TestNativeDoltStoreReadySingleBackingCallWithAllStatuses(t *testing.T) {
 		t.Fatalf("Ready: %v", err)
 	}
 	if len(got) != 1 || got[0].ID != "gc-open" {
-		t.Fatalf("Ready = %+v, want the one open bead", got)
+		t.Fatalf("Ready = %+v, want the one open bead (deduped across per-status calls)", got)
 	}
-	if len(calls) != 1 {
-		t.Fatalf("backing GetReadyWork calls = %d, want 1 (filters: %+v)", len(calls), calls)
+	if len(calls) != len(nativeDoltOpenReadyStatuses) {
+		t.Fatalf("backing GetReadyWork calls = %d, want %d (one per open-class status; filters: %+v)",
+			len(calls), len(nativeDoltOpenReadyStatuses), calls)
 	}
-	if calls[0].Status != "" {
-		t.Fatalf("singular Status = %q, want empty (Statuses must carry the set)", calls[0].Status)
-	}
-	if !reflect.DeepEqual(calls[0].Statuses, nativeDoltOpenReadyStatuses) {
-		t.Fatalf("Statuses = %v, want %v", calls[0].Statuses, nativeDoltOpenReadyStatuses)
-	}
-	if !calls[0].IncludeEphemeral {
-		t.Fatal("IncludeEphemeral must be set for TierBoth")
+	for i, st := range nativeDoltOpenReadyStatuses {
+		if calls[i].Status != st {
+			t.Fatalf("call %d Status = %q, want %q", i, calls[i].Status, st)
+		}
+		if !calls[i].IncludeEphemeral {
+			t.Fatalf("call %d IncludeEphemeral must be set for TierBoth", i)
+		}
 	}
 }
 
-func TestNativeDoltStoreReadyAssigneeSingleBackingCall(t *testing.T) {
+func TestNativeDoltStoreReadyAssigneePerStatusCalls(t *testing.T) {
 	var calls []beadslib.WorkFilter
 	storage := &nativeDoltStorageSpy{
 		getReadyWork: func(_ context.Context, filter beadslib.WorkFilter) ([]*beadslib.Issue, error) {
@@ -76,13 +68,15 @@ func TestNativeDoltStoreReadyAssigneeSingleBackingCall(t *testing.T) {
 	if _, err := store.Ready(ReadyQuery{TierMode: TierBoth, Assignee: "probe-me", Limit: 3}); err != nil {
 		t.Fatalf("Ready: %v", err)
 	}
-	if len(calls) != 1 {
-		t.Fatalf("backing GetReadyWork calls = %d, want 1", len(calls))
+	if len(calls) != len(nativeDoltOpenReadyStatuses) {
+		t.Fatalf("backing GetReadyWork calls = %d, want %d", len(calls), len(nativeDoltOpenReadyStatuses))
 	}
-	if calls[0].Assignee == nil || *calls[0].Assignee != "probe-me" {
-		t.Fatalf("Assignee filter = %v, want probe-me", calls[0].Assignee)
-	}
-	if calls[0].Limit != 0 {
-		t.Fatalf("backing Limit = %d, want 0 (limit applies client-side after the gc post-filter)", calls[0].Limit)
+	for i := range calls {
+		if calls[i].Assignee == nil || *calls[i].Assignee != "probe-me" {
+			t.Fatalf("call %d Assignee filter = %v, want probe-me", i, calls[i].Assignee)
+		}
+		if calls[i].Limit != 0 {
+			t.Fatalf("call %d backing Limit = %d, want 0 (limit applies client-side after the gc post-filter)", i, calls[i].Limit)
+		}
 	}
 }
