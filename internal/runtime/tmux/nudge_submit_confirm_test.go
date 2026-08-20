@@ -19,7 +19,7 @@ func TestSubmitEnterAndConfirmReEntersWhileIdle(t *testing.T) {
 	busy := func() (bool, error) { return enters >= 2, nil }
 	sendEnter := func() error { enters++; return nil }
 
-	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, noSleep)
+	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, nil, false, noSleep)
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -38,7 +38,7 @@ func TestSubmitEnterAndConfirmStopsWhenBusy(t *testing.T) {
 	busy := func() (bool, error) { return enters >= 1, nil }
 	sendEnter := func() error { enters++; return nil }
 
-	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, noSleep)
+	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, nil, false, noSleep)
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -63,7 +63,7 @@ func TestSubmitEnterAndConfirmNoDoubleSubmitOnFastTurn(t *testing.T) {
 	}
 	sendEnter := func() error { enters++; return nil }
 
-	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, noSleep)
+	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, nil, false, noSleep)
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -83,7 +83,7 @@ func TestSubmitEnterAndConfirmBestEffortWhenNeverBusy(t *testing.T) {
 	busy := func() (bool, error) { return false, nil }
 	sendEnter := func() error { enters++; return nil }
 
-	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, noSleep)
+	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, nil, false, noSleep)
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -110,7 +110,7 @@ func TestSubmitEnterAndConfirmClearsStaleSendError(t *testing.T) {
 	}
 	busy := func() (bool, error) { return false, nil }
 
-	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, noSleep)
+	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, nil, false, noSleep)
 	if err != nil {
 		t.Fatalf("err = %v, want nil (later send succeeded)", err)
 	}
@@ -130,7 +130,7 @@ func TestSubmitEnterAndConfirmReturnsSendError(t *testing.T) {
 	sendEnter := func() error { enters++; return sendErr }
 	busy := func() (bool, error) { return false, nil }
 
-	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, noSleep)
+	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, nil, false, noSleep)
 	if confirmed {
 		t.Fatal("confirmed = true, want false")
 	}
@@ -139,5 +139,126 @@ func TestSubmitEnterAndConfirmReturnsSendError(t *testing.T) {
 	}
 	if enters != submitEnterMaxSends {
 		t.Fatalf("enters = %d, want %d", enters, submitEnterMaxSends)
+	}
+}
+
+// TestSubmitEnterAndConfirmBusyPaneFalsePositive is the regression test for
+// gc-6h603 (ra-oudpha "LIVE RESIDUAL"): a nudge sent into an ALREADY-busy pane
+// must not confirm off the pre-existing busy indicator while the draft still
+// sits in the composer. With a plain-Enter sequence (enterOnly), the loop
+// re-sends Enter into the busy pane — claude queues the draft — and confirms
+// only when the draft actually leaves the composer.
+func TestSubmitEnterAndConfirmBusyPaneFalsePositive(t *testing.T) {
+	var enters int
+	busy := func() (bool, error) { return true, nil } // busy BEFORE the nudge, stays busy
+	draftGone := func() (bool, error) { return enters >= 2, nil }
+	sendEnter := func() error { enters++; return nil }
+
+	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, draftGone, true, noSleep)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if !confirmed {
+		t.Fatal("confirmed = false, want true (re-sent Enter queues the draft in a busy pane)")
+	}
+	if enters != 2 {
+		t.Fatalf("enters = %d, want 2 (first Enter swallowed by paste race, second lands)", enters)
+	}
+}
+
+// TestSubmitEnterAndConfirmDraftGoneIsPrimary proves the draft signal confirms
+// a submit even when the busy indicator never fires (fast turn, or a provider
+// whose busy render lags).
+func TestSubmitEnterAndConfirmDraftGoneIsPrimary(t *testing.T) {
+	var enters int
+	busy := func() (bool, error) { return false, nil }
+	draftGone := func() (bool, error) { return enters >= 1, nil }
+	sendEnter := func() error { enters++; return nil }
+
+	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, draftGone, true, noSleep)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if !confirmed {
+		t.Fatal("confirmed = false, want true (draft left the composer)")
+	}
+	if enters != 1 {
+		t.Fatalf("enters = %d, want 1", enters)
+	}
+}
+
+// TestSubmitEnterAndConfirmDraftStuckSurfacesUnconfirmed proves a draft that
+// never leaves the composer is reported unconfirmed (false, nil) after bounded
+// sends — the caller surfaces ErrNudgeSubmitUnconfirmed and the nudge requeues
+// instead of being acked as delivered.
+func TestSubmitEnterAndConfirmDraftStuckSurfacesUnconfirmed(t *testing.T) {
+	var enters int
+	busy := func() (bool, error) { return true, nil }
+	draftGone := func() (bool, error) { return false, nil }
+	sendEnter := func() error { enters++; return nil }
+
+	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, draftGone, true, noSleep)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if confirmed {
+		t.Fatal("confirmed = true, want false (draft never left the composer)")
+	}
+	if enters != submitEnterMaxSends {
+		t.Fatalf("enters = %d, want %d", enters, submitEnterMaxSends)
+	}
+}
+
+// TestSubmitEnterAndConfirmEscapeSequenceNeverResentIntoBusyPane proves the
+// codex hazard guard: a multi-key (Escape-leading) sequence is not re-sent
+// once the pane is busy; the draft state decides the verdict instead.
+func TestSubmitEnterAndConfirmEscapeSequenceNeverResentIntoBusyPane(t *testing.T) {
+	var enters int
+	busy := func() (bool, error) { return enters >= 1, nil } // busy after first send
+	draftGone := func() (bool, error) { return enters >= 1, nil }
+	sendEnter := func() error { enters++; return nil }
+
+	confirmed, err := submitEnterAndConfirm(sendEnter, func() {}, busy, draftGone, false, noSleep)
+	if err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	if !confirmed {
+		t.Fatal("confirmed = false, want true")
+	}
+	if enters != 1 {
+		t.Fatalf("enters = %d, want 1 (Escape-leading sequence must not repeat into a busy pane)", enters)
+	}
+}
+
+// TestDraftSnippetAndComposerLines pins the composer-observation helpers.
+func TestDraftSnippetAndComposerLines(t *testing.T) {
+	if got := draftSnippet("check the redis upgrade decision"); got != "check the redis upgrade decision" {
+		t.Fatalf("draftSnippet = %q", got)
+	}
+	long := "0123456789012345678901234567890123456789"
+	if got := draftSnippet(long); len([]rune(got)) != 32 {
+		t.Fatalf("draftSnippet long = %q (len %d), want 32 runes", got, len([]rune(got)))
+	}
+	if got := draftSnippet("\n\n  second line is first non-empty  \nrest"); got != "second line is first non-empty" {
+		t.Fatalf("draftSnippet multiline = %q", got)
+	}
+	lines := []string{
+		"⏺ Working on it",
+		"> check the redis upgrade decision", // transcript echo: ASCII >, not the composer
+		"────────────",
+		"❯ check the redis upgrade decision", // composer draft
+		"  ⏵⏵ bypass permissions on",
+	}
+	if !composerLinesHoldDraft(lines, "check the redis upgrade decision") {
+		t.Fatal("composerLinesHoldDraft = false, want true (draft on ❯ line)")
+	}
+	submitted := []string{
+		"> check the redis upgrade decision", // echoed into transcript
+		"────────────",
+		"❯ ", // empty composer
+		"  ⏵⏵ bypass permissions on",
+	}
+	if composerLinesHoldDraft(submitted, "check the redis upgrade decision") {
+		t.Fatal("composerLinesHoldDraft = true, want false (transcript echo must not count)")
 	}
 }

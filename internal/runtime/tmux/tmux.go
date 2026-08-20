@@ -1955,29 +1955,62 @@ const (
 
 // submitEnterAndConfirm sends the provider's submit key sequence (see
 // nudgeSubmitKeySequences — a single Enter for every family this fork has
-// verified so far) and confirms the message submitted by observing the
-// agent transition to its busy/processing state. It re-sends the sequence
-// only while the pane remains idle (submission not yet observed), so a turn
-// that already started can never receive a second submit.
+// verified so far) and confirms the message submitted.
+//
+// Confirmation signal (ra-oudpha / gascity#5012 "LIVE RESIDUAL", root-caused
+// 2026-08-20 from two live specimens, gc-6h603): the historical busy-indicator
+// signal is a FALSE POSITIVE whenever the nudge lands in a pane that is
+// ALREADY busy — Provider.Nudge's idle-wait falls back to sending into a busy
+// pane after NudgeIdleTimeout, the paste-raced Enter is swallowed, and the
+// pre-existing busy state "confirms" a submit that never happened. The text
+// then sits drafted in the composer forever. So the primary signal is now
+// draftGone — direct observation that the pasted text left the composer —
+// with the busy transition kept only as a fallback when the draft cannot be
+// observed (capture error, or no draftGone injected).
+//
+// Re-send policy: enterOnly submit sequences (plain Enter — every family
+// without a nudgeSubmitKeySequences entry) are safe to re-send into a busy
+// pane: claude-family TUIs queue the drafted message behind the in-flight
+// turn. Multi-key sequences that lead with Escape (codex) are NEVER re-sent
+// into a busy pane — Escape there is an interrupt (see the RE-SEND HAZARD
+// note at the call site).
 //
 // Returns:
-//   - (true, nil)  — the agent went busy: the message submitted.
-//   - (false, nil) — the submit sequence was delivered to tmux but busy was
-//     never observed within the budget (best-effort; preserves the
+//   - (true, nil)  — the draft left the composer (or, fallback, the agent
+//     went busy): the message submitted.
+//   - (false, nil) — the submit sequence was delivered to tmux but submission
+//     was never confirmed within the budget (best-effort; preserves the
 //     historical "nil == handed to tmux" contract so callers do not
 //     re-paste).
 //   - (false, err) — every submit attempt failed at the tmux layer.
 //
 // All side effects are injected so the decision logic is unit-testable without
 // a live tmux server.
-func submitEnterAndConfirm(sendSubmit func() error, wake func(), busy func() (bool, error), sleep func(time.Duration)) (bool, error) {
+func submitEnterAndConfirm(sendSubmit func() error, wake func(), busy func() (bool, error), draftGone func() (bool, error), enterOnly bool, sleep func(time.Duration)) (bool, error) {
+	confirmed := func() (bool, error) {
+		if draftGone != nil {
+			if gone, err := draftGone(); err == nil {
+				return gone, nil
+			}
+		}
+		return busy()
+	}
 	var lastErr error
 	for send := 0; send < submitEnterMaxSends; send++ {
 		if send > 0 {
-			// Re-confirm the pane is still idle before re-sending. A turn that
-			// already submitted (busy) must never receive a second Enter.
-			if isBusy, err := busy(); err == nil && isBusy {
-				return true, nil
+			if !enterOnly {
+				// Escape-leading sequences must never be re-sent into a busy
+				// pane (Escape is an interrupt there). If busy, report what
+				// the draft says; without draft observation, preserve the
+				// historical assumption that busy means submitted.
+				if isBusy, err := busy(); err == nil && isBusy {
+					if draftGone != nil {
+						if gone, err := draftGone(); err == nil {
+							return gone, nil
+						}
+					}
+					return true, nil
+				}
 			}
 			sleep(submitReEnterBackoff)
 		}
@@ -1988,13 +2021,67 @@ func submitEnterAndConfirm(sendSubmit func() error, wake func(), busy func() (bo
 		lastErr = nil // a later send succeeded; don't surface an earlier transient failure
 		wake()
 		for poll := 0; poll < submitConfirmPollsPerSend; poll++ {
-			if isBusy, err := busy(); err == nil && isBusy {
+			if ok, err := confirmed(); err == nil && ok {
 				return true, nil
 			}
 			sleep(submitConfirmPollInterval)
 		}
 	}
 	return false, lastErr
+}
+
+// composerPromptMarker is the prompt glyph claude-family TUIs render at the
+// start of the composer (input box) line. Past user turns echo into the
+// transcript with a plain ASCII ">", so a line holding BOTH this marker and
+// the draft snippet identifies text still sitting unsubmitted in the composer.
+const composerPromptMarker = "❯"
+
+// composerObservationLines bounds the pane tail searched for the composer.
+// The composer box plus status footer occupy the last few rows; 10 lines
+// covers multi-line drafts without reaching transcript echoes higher up.
+const composerObservationLines = 10
+
+// draftSnippet returns the fragment of a pasted message expected to be
+// visible on the composer's prompt line: the first non-empty line, capped so
+// pane-width wrapping cannot push it off the prompt row.
+func draftSnippet(message string) string {
+	for _, line := range strings.Split(message, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		runes := []rune(line)
+		if len(runes) > 32 {
+			runes = runes[:32]
+		}
+		return string(runes)
+	}
+	return ""
+}
+
+// composerDraftGone reports whether the composer no longer shows snippet on
+// its prompt line. An unobservable pane surfaces the error so callers can
+// fall back to the busy heuristic rather than mistake blindness for success.
+func (t *Tmux) composerDraftGone(target, snippet string) (bool, error) {
+	if snippet == "" {
+		return false, fmt.Errorf("empty draft snippet")
+	}
+	lines, err := t.CapturePaneLines(target, composerObservationLines)
+	if err != nil {
+		return false, err
+	}
+	return !composerLinesHoldDraft(lines, snippet), nil
+}
+
+// composerLinesHoldDraft reports whether any captured pane line shows the
+// draft snippet on a composer prompt line.
+func composerLinesHoldDraft(lines []string, snippet string) bool {
+	for _, line := range lines {
+		if strings.Contains(line, composerPromptMarker) && strings.Contains(line, snippet) {
+			return true
+		}
+	}
+	return false
 }
 
 // paneBusy reports whether the target pane shows an active processing indicator
@@ -2188,7 +2275,15 @@ func (t *Tmux) NudgeSession(session, message string) error {
 	sendSubmit := func() error { return t.sendNudgeSubmitSequence(target, submitKeys) }
 	wake := func() { t.WakePaneIfDetached(session) }
 	if t.submitVerifyEligible(target) {
-		confirmed, err := submitEnterAndConfirm(sendSubmit, wake, func() (bool, error) { return t.paneBusy(target) }, time.Sleep)
+		// Confirm by direct composer observation (gc-6h603): busy alone is a
+		// false positive when the nudge was sent into an already-busy pane.
+		snippet := draftSnippet(message)
+		var draftGone func() (bool, error)
+		if snippet != "" {
+			draftGone = func() (bool, error) { return t.composerDraftGone(target, snippet) }
+		}
+		enterOnly := len(submitKeys) == 1 && submitKeys[0] == "Enter"
+		confirmed, err := submitEnterAndConfirm(sendSubmit, wake, func() (bool, error) { return t.paneBusy(target) }, draftGone, enterOnly, time.Sleep)
 		if err != nil {
 			return fmt.Errorf("failed to send submit sequence: %w", err)
 		}
