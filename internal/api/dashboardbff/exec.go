@@ -17,13 +17,16 @@ const (
 	maxConcurrent = 4         // simultaneous subprocesses
 
 	gitLogTimeout = 10 * time.Second
-	// bd doctor's Orphaned Dependencies check runs an unindexable
-	// COALESCE-join over dependencies x issues; on a large rig (gcas:
-	// ~15k deps, ~16k issues) the full doctor takes ~21s, which blew the
-	// previous 15s budget and made the health panel report "probe failed:
-	// exec timed out" instead of the rig's actual state. The probe runs on
-	// a 5-minute cadence, so a 60s ceiling is cheap (30s proved too thin under sampler+order contention); the query itself is
-	// tracked for an upstream fix.
+	// bd doctor's Dependency Cycles check enumerates all simple dependency
+	// paths via a recursive CTE with string-concat visited tracking —
+	// exponential in path count; on a large rig (gcas: ~15k dependency
+	// edges) it runs until the mysql client read timeout kills it, so the
+	// full doctor takes ~21s. That blew the original 15s budget and made
+	// the health panel report "probe failed: exec timed out" instead of
+	// the rig's actual state, and 30s proved too thin when rig probes and
+	// scheduled orders fire on the same 5-minute tick. 60s is cheap at
+	// that cadence; the check itself is tracked for an upstream beads fix
+	// (gc-0gjqg: pull edges, detect cycles in Go).
 	bdDoctorTimeout = 60 * time.Second
 	gitLogRecentN   = "200"
 )
