@@ -2073,12 +2073,16 @@ func (t *Tmux) composerDraftGone(target, snippet string) (bool, error) {
 	return !composerLinesHoldDraft(lines, snippet), nil
 }
 
-// composerLinesHoldDraft reports whether any captured pane line shows the
-// draft snippet on a composer prompt line.
+// composerLinesHoldDraft reports whether the composer still shows the draft
+// snippet. Submitted user messages echo into the transcript with the SAME
+// prompt marker (live-verified 2026-08-20 on a claude pane), so only the LAST
+// marker-bearing line — the composer input box at the pane bottom — decides;
+// treating any earlier echo as the draft would misread a successful submit as
+// a stuck draft and requeue a duplicate nudge.
 func composerLinesHoldDraft(lines []string, snippet string) bool {
-	for _, line := range lines {
-		if strings.Contains(line, composerPromptMarker) && strings.Contains(line, snippet) {
-			return true
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.Contains(lines[i], composerPromptMarker) {
+			return strings.Contains(lines[i], snippet)
 		}
 	}
 	return false

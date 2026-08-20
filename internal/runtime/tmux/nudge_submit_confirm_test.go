@@ -244,21 +244,24 @@ func TestDraftSnippetAndComposerLines(t *testing.T) {
 	}
 	lines := []string{
 		"⏺ Working on it",
-		"> check the redis upgrade decision", // transcript echo: ASCII >, not the composer
 		"────────────",
-		"❯ check the redis upgrade decision", // composer draft
+		"❯ check the redis upgrade decision", // composer draft (last marker line)
 		"  ⏵⏵ bypass permissions on",
 	}
 	if !composerLinesHoldDraft(lines, "check the redis upgrade decision") {
-		t.Fatal("composerLinesHoldDraft = false, want true (draft on ❯ line)")
+		t.Fatal("composerLinesHoldDraft = false, want true (draft on last ❯ line)")
 	}
+	// Live-verified rendering: a submitted message echoes into the transcript
+	// with the SAME ❯ marker, above the now-empty composer. Only the LAST
+	// marker line may decide, or a fresh echo reads as a stuck draft.
 	submitted := []string{
-		"> check the redis upgrade decision", // echoed into transcript
+		"❯ check the redis upgrade decision", // transcript echo of the submit
+		"  handle after this turn",
 		"────────────",
 		"❯ ", // empty composer
 		"  ⏵⏵ bypass permissions on",
 	}
 	if composerLinesHoldDraft(submitted, "check the redis upgrade decision") {
-		t.Fatal("composerLinesHoldDraft = true, want false (transcript echo must not count)")
+		t.Fatal("composerLinesHoldDraft = true, want false (transcript ❯ echo must not count)")
 	}
 }
