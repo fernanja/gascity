@@ -12,7 +12,14 @@ import (
 )
 
 var (
-	statusProviderCallTimeout    = 50 * time.Millisecond
+	// statusProviderCallTimeout bounds each individual provider call (tmux
+	// exec, etc.) made while building a status snapshot. 50ms was too tight:
+	// under real tmux-server contention (e.g. a concurrent `gc sling`
+	// hitting the same socket) a single `tmux show-environment` can take
+	// well over 50ms even though the session is genuinely alive, tripping
+	// the sticky partial-status flag and mislabeling live sessions as
+	// "unknown (partial status)" for the rest of the command (gc-rp4np).
+	statusProviderCallTimeout    = 400 * time.Millisecond
 	statusProviderTimeoutWarning = func() {
 		fmt.Fprintln(os.Stderr, "gc status: runtime status probe timed out; using partial status")
 	}
