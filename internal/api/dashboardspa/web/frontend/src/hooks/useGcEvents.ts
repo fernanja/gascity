@@ -81,6 +81,14 @@ export function useGcEventRefresh(
     let connectGraceTimer: ReturnType<typeof setTimeout> | null = null;
     let retryDelayMs = 1_000;
     let malformedEventReported = false;
+    // Set once the stream has closed at least once. A reconnect after a drop
+    // (e.g. the supervisor restarting under an already-open tab) can miss
+    // whatever events fired while the socket was down, so the underlying
+    // cached data never gets told to refresh — the panel is stuck showing
+    // its last-known snapshot even though the backend is healthy again. On
+    // the FIRST open this stays false (the mount-time useCachedData fetch
+    // already covers it); only a reconnect forces a refresh.
+    let hasDisconnectedOnce = false;
 
     const clearConnectGraceTimer = () => {
       if (connectGraceTimer === null) return;
@@ -142,6 +150,7 @@ export function useGcEventRefresh(
         clearConnectGraceTimer();
         setState('open');
         retryDelayMs = 1_000;
+        if (hasDisconnectedOnce) scheduleMatch();
       };
       // gc supervisor sends events with `event: event` (the event NAME
       // is literally "event"), not the default "message". EventSource
@@ -185,6 +194,7 @@ export function useGcEventRefresh(
         if (cancelled) return;
         clearConnectGraceTimer();
         setState('closed');
+        hasDisconnectedOnce = true;
         es?.close();
         es = null;
         // Exponential backoff capped at 30s.

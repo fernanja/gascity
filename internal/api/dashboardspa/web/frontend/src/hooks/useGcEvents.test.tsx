@@ -212,6 +212,28 @@ describe('useGcEventRefresh', () => {
       expect(eventSources).toHaveLength(4);
     });
 
+    it('forces a refresh on reconnect after a drop, but not on the initial connect', () => {
+      const onMatch = vi.fn();
+      renderHook(() => useGcEventRefresh([GC_EVENT_PREFIX.bead], onMatch));
+
+      // Initial connect: no synthetic event arrived, so no forced refresh.
+      act(() => eventSources[0]?.open());
+      expect(onMatch).not.toHaveBeenCalled();
+
+      // The stream drops (e.g. the supervisor restarting under an
+      // already-open tab) and reconnects after backoff.
+      act(() => eventSources[0]?.error());
+      act(() => {
+        vi.advanceTimersByTime(1_000);
+      });
+      expect(eventSources).toHaveLength(2);
+
+      // Reconnect opening forces a refresh so the panel doesn't stay stuck
+      // on whatever it last showed before the drop.
+      act(() => eventSources[1]?.open());
+      expect(onMatch).toHaveBeenCalledTimes(1);
+    });
+
     it('cancels a pending reconnect timer on unmount', () => {
       const { unmount } = renderHook(() => useGcEventRefresh([GC_EVENT_PREFIX.bead], vi.fn()));
       act(() => eventSources[0]?.error());
