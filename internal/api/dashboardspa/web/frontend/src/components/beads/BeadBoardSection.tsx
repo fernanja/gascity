@@ -1,4 +1,4 @@
-import type { BeadGraph } from '../../lib/beadGraph';
+import type { BeadGraph, BoardColumn } from '../../lib/beadGraph';
 import { selectColumns } from '../../lib/beadGraph';
 import { BeadBoard } from './BeadBoard';
 import type { BadgeSeverity } from '../../attention/compose';
@@ -20,6 +20,9 @@ interface BeadBoardSectionProps {
   selectedId: string | null;
   attentionSeverity?: (beadId: string) => BadgeSeverity | null;
   onSelect: (beadId: string) => void;
+  /** Forwarded to BeadBoard; omit 'done' when the caller's fetch excludes
+   *  closed beads (see BeadBoard's visibleColumns doc, gc-5qy67). */
+  visibleColumns?: readonly BoardColumn[];
 }
 
 export function BeadBoardSection({
@@ -30,6 +33,7 @@ export function BeadBoardSection({
   selectedId,
   attentionSeverity,
   onSelect,
+  visibleColumns,
 }: BeadBoardSectionProps) {
   const columns = selectColumns(graph, ids);
   return (
@@ -42,6 +46,7 @@ export function BeadBoardSection({
         columns={columns}
         selectedId={selectedId}
         {...(attentionSeverity === undefined ? {} : { attentionSeverity })}
+        {...(visibleColumns === undefined ? {} : { visibleColumns })}
         onSelect={onSelect}
       />
     </section>

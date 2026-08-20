@@ -1,4 +1,4 @@
-import { BOARD_COLUMNS, type BeadNode, type BoardColumnId } from '../../lib/beadGraph';
+import { BOARD_COLUMNS, type BeadNode, type BoardColumn, type BoardColumnId } from '../../lib/beadGraph';
 import { BeadBoardRow } from './BeadBoardRow';
 import type { BadgeSeverity } from '../../attention/compose';
 
@@ -19,12 +19,23 @@ interface BeadBoardProps {
   selectedId: string | null;
   attentionSeverity?: (beadId: string) => BadgeSeverity | null;
   onSelect: (beadId: string) => void;
+  /** Columns to render, in order. Defaults to every status column. Callers
+   *  whose fetch excludes closed beads should omit 'done' here rather than
+   *  render it permanently empty — an empty 'done' column reads as "nothing
+   *  shipped" instead of "not fetched" (gc-5qy67). */
+  visibleColumns?: readonly BoardColumn[];
 }
 
-export function BeadBoard({ columns, selectedId, attentionSeverity, onSelect }: BeadBoardProps) {
+export function BeadBoard({
+  columns,
+  selectedId,
+  attentionSeverity,
+  onSelect,
+  visibleColumns = BOARD_COLUMNS,
+}: BeadBoardProps) {
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5 gap-x-8 gap-y-8">
-      {BOARD_COLUMNS.map((col) => {
+      {visibleColumns.map((col) => {
         const nodes = columns[col.id];
         const isBlocked = col.id === 'blocked';
         const countTone = isBlocked && nodes.length > 0 ? 'text-accent' : 'text-fg-muted';

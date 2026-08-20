@@ -15,7 +15,7 @@ import { Modal } from '../components/Modal';
 import { PageHeader } from '../components/PageHeader';
 import { StatusBadge } from '../components/StatusBadge';
 import { READ_ONLY_CONTROL_TITLE, ReadOnlyBadge, useReadOnly } from '../contexts/ReadOnlyContext';
-import { buildBeadGraph } from '../lib/beadGraph';
+import { BOARD_COLUMNS, buildBeadGraph } from '../lib/beadGraph';
 import { resolveRigName, rigNameOptions } from '../lib/rigNames';
 import { useCachedData } from '../hooks/useCachedData';
 import { useGcEventRefresh } from '../hooks/useGcEvents';
@@ -263,6 +263,14 @@ export function BeadsPage() {
 
   const matched = useMemo(() => filters.groups.flatMap((group) => group.rows), [filters.groups]);
   const graph = useMemo(() => buildBeadGraph(matched), [matched]);
+  // The default fetch excludes closed beads (see showClosed above), so the
+  // 'done' column is structurally always empty until the closed chip widens
+  // the fetch — rendering it anyway reads as "the factory finished nothing"
+  // rather than "closed beads aren't loaded". Hide it until then (gc-5qy67).
+  const boardColumns = useMemo(
+    () => (showClosed ? BOARD_COLUMNS : BOARD_COLUMNS.filter((col) => col.id !== 'done')),
+    [showClosed],
+  );
   const groupIds = useMemo(() => {
     const map = new Map<string, Set<string>>();
     for (const group of filters.groups) {
@@ -466,6 +474,7 @@ export function BeadsPage() {
               ids={groupIds.get(group.projectKey) ?? EMPTY_IDS}
               selectedId={selectedId}
               attentionSeverity={beadAttentionSeverity}
+              visibleColumns={boardColumns}
               onSelect={setSelectedId}
             />
           ))}
