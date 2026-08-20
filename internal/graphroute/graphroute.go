@@ -637,12 +637,16 @@ func ApplyGraphRouting(recipe *formula.Recipe, a *config.Agent, routedTo string,
 		if i := strings.LastIndex(routedTo, "/"); i >= 0 {
 			baseName = routedTo[i+1:]
 		}
+		// A graph.v2 recipe that reaches this point NEEDS decoration: skipping
+		// it materializes beads without gc.root_store_ref / gc.scope_* and the
+		// run is undeliverable and unrenderable (invalid_snapshot in the runs
+		// view). Fail loudly instead of silently producing a corrupt run.
 		if deps.Resolver == nil {
-			return nil
+			return fmt.Errorf("graph workflow route target %q: no agent resolver available to stamp run identity", routedTo)
 		}
 		resolved, ok := deps.Resolver.ResolveAgent(cfg, baseName, rigContext)
 		if !ok {
-			return nil
+			return fmt.Errorf("graph workflow route target %q does not resolve to a configured agent (check the order's pool/target against `gc agent list`)", routedTo)
 		}
 		a = &resolved
 	}
