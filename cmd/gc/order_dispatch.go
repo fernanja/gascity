@@ -865,6 +865,15 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			continue
 		}
 		m.rememberLastRun(scoped, storeKeysForGate, trackingBead.CreatedAt)
+		if !a.NoWorkGate && !a.IsExec() {
+			// See orderWispMaterializationGrace: cover the window between this
+			// tracking bead closing and the wisp it just launched becoming
+			// visible to a later tick's open-work gate. NoWorkGate orders never
+			// consult gateBackoffUntil (they skip both gates outright above),
+			// and exec orders don't launch a wisp into a separate graph store,
+			// so neither needs this backoff.
+			m.setGateBackoff(scoped, now.Add(orderWispMaterializationGrace))
+		}
 		if spendDispatchBudget(idx) {
 			return
 		}
@@ -2474,6 +2483,21 @@ var orderGateTimeout = 8 * time.Second
 // the expensive gate query is genuinely skipped for a bounded span; an equal
 // window would be consumed by the gate itself, yielding no real suppression.
 var orderGateBackoffDuration = 24 * time.Second
+
+// orderWispMaterializationGrace bounds the gap between a formula/workflow
+// order's tracking bead closing and its wisp's root+descendant beads becoming
+// visible to a later tick's open-work gate (gc-h10bm). dispatchOne closes the
+// tracking bead as soon as dispatchWisp's goroutine returns from launching
+// the wisp — not once the wisp is durably visible in the graph store, which
+// can be a separate store from the orders-class store the tracking bead
+// lives in. A tick landing inside that window reads both gates as clear and
+// re-fires: merge-open-prs double-dispatched this way on 2026-08-20 (gc-ol9is:
+// 4 fires in ~6 minutes, two only 4s apart). Reusing gateBackoffUntil here
+// means a tick inside the window skips both gates outright instead of
+// re-reading them as clear; anchored to the tick's own now (unlike
+// orderGateBackoffDuration) because this call site is not preceded by a
+// blocking gate read, so no real-time drift from tick-start has occurred yet.
+var orderWispMaterializationGrace = 20 * time.Second
 
 // errGateTimeout marks an open-work gate error caused by the per-order
 // bound elapsing (the #2893 contention case), as opposed to ctx cancel or a

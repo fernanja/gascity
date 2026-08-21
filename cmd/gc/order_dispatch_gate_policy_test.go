@@ -472,3 +472,139 @@ func TestOrderDispatchNoWorkGateSkipsTrackingGateDirectly(t *testing.T) {
 		t.Errorf("NoWorkGate order must issue ZERO gate queries; got %d", got)
 	}
 }
+
+// TestOrderDispatchWispMaterializationGraceSuppressesImmediateRefire is the
+// gc-h10bm regression test. dispatchOne closes a formula/workflow order's
+// tracking bead as soon as dispatchWisp's goroutine returns from launching
+// the wisp, not once the wisp's root and descendant beads are visible to a
+// later tick's open-work gate — those can live in a separate graph store with
+// its own write/commit-visibility timeline. merge-open-prs double-dispatched
+// this way on 2026-08-20 (gc-ol9is: 4 fires in ~6 minutes, two only 4s apart).
+//
+// A MemStore has no such visibility lag to reproduce directly, so this test
+// proves the mitigation's actual contract instead: even in the state most
+// favorable to a second fire — the prior wisp already fully closed out, so
+// both open-work gates read the order as idle on their own — a tick landing
+// inside orderWispMaterializationGrace after the first fire must still not
+// dispatch again, and a tick after the grace window elapses must.
+func TestOrderDispatchWispMaterializationGraceSuppressesImmediateRefire(t *testing.T) {
+	prevGrace := orderWispMaterializationGrace
+	orderWispMaterializationGrace = 10 * time.Second
+	defer func() { orderWispMaterializationGrace = prevGrace }()
+
+	store := beads.NewMemStore()
+	// Anchored to real time (like TestOrderDispatchCooldownDue), not a fixed
+	// literal: the tracking bead's CreatedAt is stamped by MemStore.Create via
+	// time.Now(), so the due-check's lastRun must share that same timeline as
+	// the `now` passed to dispatch, not drift from a hardcoded date.
+	tick1Now := time.Now()
+
+	aa := []orders.Order{{
+		Name:         "test-order",
+		Trigger:      "cooldown",
+		Interval:     "1s",
+		Formula:      "test-formula",
+		FormulaLayer: sharedTestFormulaDir,
+	}}
+	ad := buildOrderDispatcherFromList(aa, store, nil)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	cityPath := t.TempDir()
+
+	// trackingBeads matches by label, which both the tracking bead itself
+	// (title "order:<scoped>") and its wisp's root/work bead share — count
+	// only the former, i.e. one per actual dispatch (mirrors the title-prefix
+	// filter workBeadByOrderLabel uses to isolate the latter).
+	countTrackingBeads := func() int {
+		n := 0
+		for _, b := range trackingBeads(t, store, "order-run:test-order") {
+			if strings.HasPrefix(b.Title, "order:") {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Tick 1: due (no prior run), fires. Creates a tracking bead and a wisp
+	// (root + "work" step).
+	ad.dispatch(context.Background(), cityPath, tick1Now)
+	ad.drain(context.Background())
+	if got := countTrackingBeads(); got != 1 {
+		t.Fatalf("tick 1: expected exactly 1 tracking bead, got %d", got)
+	}
+
+	// Close every bead the wisp created, so both open-work gates would, on
+	// their own reading of the store, report the order fully idle.
+	all, err := store.List(beads.ListQuery{AllowScan: true})
+	if err != nil {
+		t.Fatalf("listing beads: %v", err)
+	}
+	for _, b := range all {
+		if err := store.Close(b.ID); err != nil {
+			t.Fatalf("closing %s: %v", b.ID, err)
+		}
+	}
+
+	// Tick 2: the 1s cooldown has elapsed and both gates read clear, but this
+	// tick lands inside the materialization grace window set by tick 1's
+	// fire — it must not dispatch again.
+	ad.dispatch(context.Background(), cityPath, tick1Now.Add(2*time.Second))
+	ad.drain(context.Background())
+	if got := countTrackingBeads(); got != 1 {
+		t.Fatalf("tick 2 (inside grace window): expected still exactly 1 tracking bead, got %d — double-dispatch (gc-h10bm)", got)
+	}
+
+	// Tick 3: past the grace window (tick1 + grace + margin). The order is
+	// free to fire again.
+	ad.dispatch(context.Background(), cityPath, tick1Now.Add(13*time.Second))
+	ad.drain(context.Background())
+	if got := countTrackingBeads(); got != 2 {
+		t.Fatalf("tick 3 (after grace window): expected 2 tracking beads total, got %d", got)
+	}
+}
+
+// TestOrderDispatchWispMaterializationGraceSkipsExecAndNoWorkGateOrders
+// narrows the previous test to the call site's scoping: an exec order (no
+// wisp, no separate graph store to lag) and a NoWorkGate order (which never
+// consults gateBackoffUntil at all — it skips both gates outright) must both
+// be free to fire again immediately, unlike a plain formula order.
+func TestOrderDispatchWispMaterializationGraceSkipsExecAndNoWorkGateOrders(t *testing.T) {
+	prevGrace := orderWispMaterializationGrace
+	orderWispMaterializationGrace = 10 * time.Second
+	defer func() { orderWispMaterializationGrace = prevGrace }()
+
+	store := beads.NewMemStore()
+	tick1Now := time.Now()
+
+	aa := []orders.Order{
+		{Name: "exec-order", Trigger: "cooldown", Interval: "1s", Exec: "true"},
+		{Name: "nowork-order", Trigger: "cooldown", Interval: "1s", Exec: "true", NoWorkGate: true},
+	}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, successfulExec, nil)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	cityPath := t.TempDir()
+
+	ad.dispatch(context.Background(), cityPath, tick1Now)
+	ad.drain(context.Background())
+	if got := trackingBeads(t, store, "order-run:exec-order"); len(got) != 1 {
+		t.Fatalf("tick 1: exec-order expected exactly 1 tracking bead, got %d", len(got))
+	}
+	if got := trackingBeads(t, store, "order-run:nowork-order"); len(got) != 1 {
+		t.Fatalf("tick 1: nowork-order expected exactly 1 tracking bead, got %d", len(got))
+	}
+
+	// Well inside the grace window that a formula order's fire would set —
+	// but neither of these orders is a formula order, so neither call site
+	// guard (!IsExec, !NoWorkGate) applies, and both are due again.
+	ad.dispatch(context.Background(), cityPath, tick1Now.Add(2*time.Second))
+	ad.drain(context.Background())
+	if got := trackingBeads(t, store, "order-run:exec-order"); len(got) != 2 {
+		t.Fatalf("tick 2: exec-order expected 2 tracking beads (grace window must not apply to exec orders), got %d", len(got))
+	}
+	if got := trackingBeads(t, store, "order-run:nowork-order"); len(got) != 2 {
+		t.Fatalf("tick 2: nowork-order expected 2 tracking beads (grace window must not apply to NoWorkGate orders), got %d", len(got))
+	}
+}
