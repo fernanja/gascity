@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 )
@@ -133,10 +134,66 @@ func (s *transcriptService) Append(ctx context.Context, input AppendTranscriptIn
 		if err := s.store.SetMetadataBatch(state.ID, updates); err != nil {
 			return fmt.Errorf("update transcript state: %w", err)
 		}
+		// Transcript lifecycle (gc-p08bi): an open transcript bead means
+		// pending work — outbound "delivery unconfirmed", inbound
+		// "unanswered". An outbound entry is recorded at the provider-ack
+		// point (the adapter appends after the provider accepts the
+		// message), so it closes as delivered here; and a delivered reply
+		// answers everything before it in the conversation, so every still
+		// -open inbound with a lower sequence closes as answered. Both are
+		// best-effort: the message record itself must survive a close
+		// hiccup, and any leftover open inbound is caught by the next
+		// outbound's sweep (sequence < N covers all prior entries).
+		if kind == TranscriptMessageOutbound {
+			s.closeDeliveredOutboundLocked(created.ID)
+			s.closeAnsweredInboundsLocked(ref, sequence, created.ID)
+		}
 		out, err = decodeTranscriptBead(created)
 		return err
 	})
 	return out, err
+}
+
+// closeDeliveredOutboundLocked closes a just-recorded outbound transcript
+// entry as delivered. Recording happens at the provider-ack point, so the
+// closure documents confirmed delivery; a failed delivery never reaches
+// Append and would leave no bead at all (the send path surfaces its own
+// error). Best-effort by design — see the call site.
+func (s *transcriptService) closeDeliveredOutboundLocked(id string) {
+	_ = s.store.SetMetadataBatch(id, map[string]string{
+		"closed_reason": "delivered",
+		"closed_at":     formatTime(time.Now()),
+	})
+	_ = s.store.Close(id)
+}
+
+// closeAnsweredInboundsLocked closes every still-open inbound transcript
+// entry with a sequence below answeredBefore in the conversation: a delivered
+// reply answers everything before it. answeredBy records which outbound entry
+// performed the close. Best-effort by design — see the call site.
+func (s *transcriptService) closeAnsweredInboundsLocked(ref ConversationRef, answeredBefore int64, answeredBy string) {
+	items, err := s.store.List(beads.ListQuery{Label: transcriptConversationLabel(ref)})
+	if err != nil {
+		return
+	}
+	for _, item := range items {
+		if item.Status == "closed" || !hasLabel(item, labelTranscriptBase) {
+			continue
+		}
+		if item.Metadata["kind"] != string(TranscriptMessageInbound) {
+			continue
+		}
+		seq, err := strconv.ParseInt(item.Metadata["sequence"], 10, 64)
+		if err != nil || seq >= answeredBefore {
+			continue
+		}
+		_ = s.store.SetMetadataBatch(item.ID, map[string]string{
+			"closed_reason": "answered",
+			"answered_by":   answeredBy,
+			"closed_at":     formatTime(time.Now()),
+		})
+		_ = s.store.Close(item.ID)
+	}
 }
 
 func (s *transcriptService) List(ctx context.Context, input ListTranscriptInput) ([]ConversationTranscriptRecord, error) {
@@ -795,13 +852,16 @@ func (s *transcriptService) findStateLocked(ref ConversationRef) (*ConversationT
 }
 
 func (s *transcriptService) findTranscriptByProviderMessageLocked(ref ConversationRef, providerMessageID string) (*ConversationTranscriptRecord, error) {
-	items, err := s.store.List(beads.ListQuery{Label: transcriptProviderMessageLabel(ref, providerMessageID)})
+	// Transcript entries are created closed (see Append), so this dedup lookup
+	// must include closed beads or every redelivery would look unseen and
+	// create a duplicate entry.
+	items, err := s.store.List(beads.ListQuery{Label: transcriptProviderMessageLabel(ref, providerMessageID), IncludeClosed: true})
 	if err != nil {
 		return nil, fmt.Errorf("list transcript by provider message label: %w", err)
 	}
 	var out *ConversationTranscriptRecord
 	for _, item := range items {
-		if !hasLabel(item, "gc:extmsg-transcript") || item.Status == "closed" {
+		if !hasLabel(item, "gc:extmsg-transcript") {
 			continue
 		}
 		record, err := decodeTranscriptBead(item)
@@ -867,13 +927,15 @@ func (s *transcriptService) listTranscriptLocked(ref ConversationRef, after int6
 	descending := order == TranscriptOrderDesc
 	records := make([]ConversationTranscriptRecord, 0, limit)
 	appendBucket := func(bucket int64) error {
-		items, err := s.store.List(beads.ListQuery{Label: transcriptBucketLabel(ref, bucket)})
+		// Transcript entries are created closed (see Append), so history reads
+		// must include closed beads or every bucket would read back empty.
+		items, err := s.store.List(beads.ListQuery{Label: transcriptBucketLabel(ref, bucket), IncludeClosed: true})
 		if err != nil {
 			return fmt.Errorf("list transcript bucket %d: %w", bucket, err)
 		}
 		bucketRecords := make([]ConversationTranscriptRecord, 0, len(items))
 		for _, item := range items {
-			if !hasLabel(item, "gc:extmsg-transcript") || item.Status == "closed" {
+			if !hasLabel(item, "gc:extmsg-transcript") {
 				continue
 			}
 			record, err := decodeTranscriptBead(item)
