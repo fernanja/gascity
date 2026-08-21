@@ -2097,6 +2097,17 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 	}
 	if a.Pool != "" {
 		update.Metadata = map[string]string{beadmeta.RoutedToMetadataKey: pool}
+		if cookResult.GraphWorkflow {
+			// A graph.v2 root is a latch, not work: workflow-finalize (a
+			// control bead) closes it, and agents must never claim it. The
+			// route stamp stays — it is the pool's wake signal (nudge-on-route
+			// reads gc.routed_to off this update's bead.updated event) — but
+			// the canonical dispatch hold makes every demand/claim tier skip
+			// the root, so a pool worker is not burned discovering the latch
+			// and closing it out from under finalize (gc-kg0qq). The v1
+			// poured path, whose root IS the claimable unit, is unaffected.
+			update.Labels = append(update.Labels, beadmeta.HoldExternalLabel)
+		}
 	}
 	if err := graphStore.Update(rootID, update); err != nil {
 		// Label failure is critical for duplicate-dispatch prevention.

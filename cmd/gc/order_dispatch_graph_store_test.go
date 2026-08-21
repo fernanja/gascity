@@ -858,3 +858,52 @@ func TestOrderDispatchPouredV1MoleculeRelocatesWithTheGraphClass(t *testing.T) {
 	}
 	t.Logf("KNOWN GAP (ga-fk1a5): a v1 poured order molecule is materialized in the graph binding, where `gc hook`'s work-scope query cannot see its assigned steps")
 }
+
+// TestOrderDispatchGraphWorkflowRootCarriesDispatchHold pins the root-latch
+// contract for pool-routed graph.v2 orders: the root keeps gc.routed_to (the
+// nudge-on-route wake signal reads it off this update's bead.updated event)
+// but carries the canonical dispatch hold, so demand/claim tiers skip it —
+// workflow-finalize owns closing the root, not a pool worker (gc-kg0qq: every
+// formula run burned one worker turn claiming the latch, and the worker's
+// early close raced finalize's own subtree accounting).
+func TestOrderDispatchGraphWorkflowRootCarriesDispatchHold(t *testing.T) {
+	cityPath, cfg, a := newGraphOrderFixture(t)
+	a.Pool = "worker"
+	workStore := beads.NewMemStore()
+	workStore.IDPrefix = "mc"
+	graphStore := beads.NewMemStore()
+	graphStore.IDPrefix = "gcg"
+
+	var rec memRecorder
+	dispatchCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m := &memoryOrderDispatcher{
+		aa:                   []orders.Order{a},
+		storeFn:              func(execStoreTarget) (beads.Store, error) { return workStore, nil },
+		storageRoutes:        messagingSplitRoutes(graphStore),
+		cfg:                  cfg,
+		cityName:             "test-city",
+		cityPath:             cityPath,
+		rec:                  &rec,
+		stderr:               io.Discard,
+		maxDispatchesPerTick: 1,
+		dispatchCtx:          dispatchCtx,
+		dispatchCancel:       cancel,
+	}
+	dispatchGraphOrder(t, m, cityPath)
+
+	if rec.hasType(events.OrderFailed) || !rec.hasType(events.OrderCompleted) {
+		t.Fatalf("events = %+v, want completed without failure", rec.events)
+	}
+
+	root := workflowRoot(t, graphStore)
+	if !hasLabel(root.Labels, beadmeta.HoldExternalLabel) {
+		t.Fatalf("root labels = %v, want the canonical dispatch hold %q so no worker claims the latch", root.Labels, beadmeta.HoldExternalLabel)
+	}
+	if routed := root.Metadata[beadmeta.RoutedToMetadataKey]; routed == "" {
+		t.Fatalf("root gc.routed_to is empty; the route stamp is the pool wake signal and must survive the hold")
+	}
+	if !hasLabel(root.Labels, "order-run:reaper") {
+		t.Fatalf("root labels = %v, want order-run:reaper alongside the hold", root.Labels)
+	}
+}
