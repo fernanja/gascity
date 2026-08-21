@@ -886,6 +886,14 @@ func doOrderRunWithJSON(aa []orders.Order, name, rig, cityPath string, store bea
 	}
 	if a.Pool != "" {
 		update.Metadata = map[string]string{beadmeta.RoutedToMetadataKey: pool}
+		if cookResult.GraphWorkflow {
+			// Same root-latch contract as the dispatcher twin (dispatchOne,
+			// order_dispatch.go): a graph.v2 root keeps its route stamp (the
+			// nudge-on-route wake signal) but carries the canonical dispatch
+			// hold so no demand/claim tier serves the latch to a worker —
+			// workflow-finalize owns closing it (gc-kg0qq).
+			update.Labels = append(update.Labels, beadmeta.HoldExternalLabel)
+		}
 	}
 	if err := moleculeStore.Update(rootID, update); err != nil {
 		fmt.Fprintf(stderr, "gc order run: labeling wisp: %v\n", err) //nolint:errcheck // best-effort stderr
