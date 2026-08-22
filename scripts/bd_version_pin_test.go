@@ -80,6 +80,30 @@ func TestBDVersionPins(t *testing.T) {
 		t.Fatalf("contrib/k8s/Dockerfile.agent BD_BUILD must equal the first 10 characters of BD_CURRENT_REF (%s)", bdCurrentRef[:10])
 	}
 
+	// The embedded library may be replace-pinned to the fernanja/beads fork (a
+	// v1.2.2-based backport line; see the BD_FORK_REPLACE_VERSION block in
+	// deps.env). The require line above still anchors to BD_CURRENT_VERSION;
+	// this keeps the replace target itself from being the one pin nothing
+	// cross-checks: a replace line and the deps.env anchor must both exist and
+	// agree, or both be absent.
+	forkReplace := env["BD_FORK_REPLACE_VERSION"]
+	goModReplace := regexp.MustCompile(
+		`(?m)^replace\s+github\.com/steveyegge/beads\s+=>\s+(\S+)\s+(v\S+)\s*$`).FindStringSubmatch(goMod)
+	switch {
+	case goModReplace != nil && forkReplace == "":
+		t.Fatalf("go.mod replaces github.com/steveyegge/beads with %s %s but deps.env has no BD_FORK_REPLACE_VERSION anchor; add it so the fork pin is cross-checked",
+			goModReplace[1], goModReplace[2])
+	case goModReplace == nil && forkReplace != "":
+		t.Fatalf("deps.env BD_FORK_REPLACE_VERSION = %q but go.mod has no replace line for github.com/steveyegge/beads; remove the anchor or restore the replace", forkReplace)
+	case goModReplace != nil:
+		if got, want := goModReplace[1], "github.com/fernanja/beads"; got != want {
+			t.Fatalf("go.mod beads replace target = %q, want %q (the maintained fork)", got, want)
+		}
+		if got, want := goModReplace[2], forkReplace; got != want {
+			t.Fatalf("go.mod beads replace version = %q, want deps.env BD_FORK_REPLACE_VERSION %q", got, want)
+		}
+	}
+
 	// Anchor roles, kept as distinct contracts so a promotion cannot quietly
 	// collapse them:
 	//   BD_PREV_VERSION -- the minimum-supported bd (the matrix floor cell).
