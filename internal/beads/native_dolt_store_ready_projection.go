@@ -1,7 +1,10 @@
 package beads
 
 import (
+	"context"
 	"fmt"
+
+	beadslib "github.com/steveyegge/beads"
 )
 
 // NativeDoltStore hands readiness to the cache — listIncludesCompleteDependencies
@@ -45,21 +48,66 @@ var _ readyProjectionEnrichmentStore = (*NativeDoltStore)(nil)
 // A storage that cannot answer the column at all reports
 // ErrReadyProjectionUnsupported rather than a silently weaker cache: the
 // CachingStore then latches its degrade, declines every readiness handle, and
-// takes the backing's own Ready. Slower, and correct.
-//
-// The embedded beads dependency is pinned to v1.2.2 — the tested 1.1-line
-// code re-released after the accidental untested v1.2.0/v1.2.1 (gc-kjk3l) —
-// which predates BlockedQuerier/IsBlockedBatch entirely, so the projection is
-// unconditionally unsupported: this method reports
-// ErrReadyProjectionUnsupported and the cache serves the backing's own Ready.
-// Restore the IsBlockedBatch enrichment (see git history for this file) when
-// the dependency moves forward onto a tested release that carries the
-// projection surface again.
+// takes the backing's own Ready. Slower, and correct. The core beadslib.Storage
+// interface does not declare IsBlockedBatch (only DoltStorage composes
+// DependencyQueryStore), so this is a real branch, not a defensive one.
 func (s *NativeDoltStore) enrichReadyProjectionForCache(items []Bead) ([]Bead, error) {
 	if len(items) == 0 {
 		return items, nil
 	}
-	return items, fmt.Errorf(
-		"native ready projection: %w: embedded beads v1.2.2 (1.1 line) has no BlockedQuerier/IsBlockedBatch",
-		ErrReadyProjectionUnsupported)
+	ids := make([]string, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		// Same exclusions as the bd path: message and nudge rows are
+		// notifications rather than dependency-blocked work, and stamping them
+		// makes the CachingStore reconciler re-emit bead.updated every cycle.
+		// Leaving their IsBlocked nil keeps the reconcile diff convergent.
+		if skipBDReadyProjectionEnrichment(item) {
+			continue
+		}
+		if _, ok := seen[item.ID]; ok {
+			continue
+		}
+		seen[item.ID] = struct{}{}
+		ids = append(ids, item.ID)
+	}
+	if len(ids) == 0 {
+		return items, nil
+	}
+
+	var projection map[string]bool
+	err := s.withReadRetry(func(ctx context.Context, storage beadslib.Storage) error {
+		querier, ok := beadslib.AsBlockedQuerier(storage)
+		if !ok {
+			return fmt.Errorf("native ready projection: %w: storage %T does not expose beads.BlockedQuerier",
+				ErrReadyProjectionUnsupported, storage)
+		}
+		blocked, err := querier.IsBlockedBatch(ctx, ids)
+		if err != nil {
+			return fmt.Errorf("native ready projection: %w", err)
+		}
+		projection = blocked
+		return nil
+	})
+	if err != nil {
+		return items, err
+	}
+
+	enriched := make([]Bead, len(items))
+	copy(enriched, items)
+	for i := range enriched {
+		if skipBDReadyProjectionEnrichment(enriched[i]) {
+			continue
+		}
+		blocked, ok := projection[enriched[i].ID]
+		if !ok {
+			// ids present in neither the issues nor the wisps table are absent
+			// from the map. A row this store listed and then could not find is
+			// one that raced out of the ledger; leave its last value rather
+			// than inventing a verdict, matching the bd path exactly.
+			continue
+		}
+		enriched[i].IsBlocked = cloneBoolPtr(&blocked)
+	}
+	return enriched, nil
 }
