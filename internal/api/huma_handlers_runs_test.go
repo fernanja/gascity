@@ -817,6 +817,79 @@ func TestRunGetNotFound(t *testing.T) {
 	}
 }
 
+// TestRunGetReconcilesAgainstLiveStoreWhenFoldEventMissing guards a real
+// gap: the control-dispatcher's mutating store has no wired
+// events.Recorder, so a workflow root it closes via processWorkflowFinalize
+// can go terminal in the bead store while the fold (built purely from
+// events.jsonl) never hears about it — reporting the run "active" forever
+// (confirmed live, 2026-08-23: gcas-v7jggb closed 2026-08-22, gcas-3kcuiy
+// closed 2026-08-16, both still "active" days later). The single-run GET
+// path can afford one live point-read to catch this; the list/census
+// endpoints deliberately don't (see runFold's doc comment).
+func TestRunGetReconcilesAgainstLiveStoreWhenFoldEventMissing(t *testing.T) {
+	s := newRunServer(t,
+		beadCreatedEvent(1, runRootBead("run1", "mol-design-review-v2", "open")),
+		// No close event follows — the fold's cached root stays "open"
+		// forever, exactly like the live bug.
+	)
+	liveRoot := runRootBead("run1", "mol-design-review-v2", "closed")
+	liveRoot.Metadata["gc.outcome"] = "pass"
+	fs, ok := s.state.(*fakeState)
+	if !ok {
+		t.Fatalf("s.state = %T, want *fakeState", s.state)
+	}
+	fs.cityBeadStore = beads.NewMemStoreFrom(0, []beads.Bead{liveRoot}, nil)
+
+	out, err := s.humaHandleRunGet(context.Background(), &RunGetInput{
+		CityScope: CityScope{CityName: "test-city"},
+		RunID:     "run1",
+	})
+	if err != nil {
+		t.Fatalf("humaHandleRunGet error: %v", err)
+	}
+	if out.Body.Status != RunStatusCompleted {
+		t.Errorf("status = %q, want completed (fold says active, live store says closed)", out.Body.Status)
+	}
+}
+
+// TestRunGetSkipsLiveReconcileWhenFoldAlreadyTerminal guards the "never
+// demotes" half of the safety property: a fold that already reports the
+// root closed must not perform (or need) a live lookup at all.
+func TestRunGetSkipsLiveReconcileWhenFoldAlreadyTerminal(t *testing.T) {
+	s := newRunServer(t,
+		beadCreatedEvent(1, runRootBead("run1", "mol-design-review-v2", "closed")),
+	)
+	fs, ok := s.state.(*fakeState)
+	if !ok {
+		t.Fatalf("s.state = %T, want *fakeState", s.state)
+	}
+	fs.cityBeadStore = panicOnGetStore{t: t}
+
+	out, err := s.humaHandleRunGet(context.Background(), &RunGetInput{
+		CityScope: CityScope{CityName: "test-city"},
+		RunID:     "run1",
+	})
+	if err != nil {
+		t.Fatalf("humaHandleRunGet error: %v", err)
+	}
+	if out.Body.Status != RunStatusCompleted {
+		t.Errorf("status = %q, want completed", out.Body.Status)
+	}
+}
+
+// panicOnGetStore is a beads.Store whose Get panics — used to prove a
+// code path never performs a live store lookup, rather than merely
+// asserting the (indistinguishable) outcome of one that returns nothing
+// useful.
+type panicOnGetStore struct {
+	beads.Store
+	t *testing.T
+}
+
+func (panicOnGetStore) Get(id string) (beads.Bead, error) {
+	panic("Get should not be called when the fold is already terminal")
+}
+
 func TestRunStepsEndpoint(t *testing.T) {
 	s := newRunServer(t,
 		beadCreatedEvent(1, runRootBead("run1", "mol-adopt-pr-v2", "open")),

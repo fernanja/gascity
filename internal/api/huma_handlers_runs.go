@@ -237,7 +237,45 @@ func (s *Server) humaHandleRunGet(ctx context.Context, input *RunGetInput) (*Run
 		return nil, apierr.RunNotFound.Msgf("run not found: %s", input.RunID)
 	}
 	s.forgetRunProjectionMiss(ctx, input.RunID)
-	return &RunGetOutput{Body: laneToRun(lane, beadsByID(fold.beads), countStartedMembers(fold.beads, lane.ID))}, nil
+	byID := beadsByID(fold.beads)
+	s.reconcileRunRootAgainstLiveStore(byID, lane.ID)
+	return &RunGetOutput{Body: laneToRun(lane, byID, countStartedMembers(fold.beads, lane.ID))}, nil
+}
+
+// reconcileRunRootAgainstLiveStore covers a gap in the event-log projection
+// this whole file is built on (see runFold's doc comment): bead-lifecycle
+// events are only emitted by writes that go through a CachingStore with a
+// wired events.Recorder (the supervisor's own store setup, api_state.go's
+// wrapWithCachingStore). The control-dispatcher process opens its mutating
+// store via a bare BdStore (cmd/gc/bd_env.go's controlBdStoreForRig/City)
+// with no such hook, so a workflow root it closes through
+// processWorkflowFinalize (internal/dispatch/runtime.go) can go fully
+// terminal in the bead store while never producing a bead.updated/closed
+// event — the fold's cached root then reports that run as "active" forever,
+// with updated_at frozen at creation time, no self-healing (confirmed live:
+// gcas-v7jggb closed 2026-08-22, gcas-3kcuiy closed 2026-08-16, both still
+// "active" in this endpoint days later).
+//
+// This is the single-run GET path specifically because it can afford a
+// live point-read; the list/census endpoints intentionally avoid per-root
+// bead-store lookups for hot-path cost (see this file's package doc). Only
+// promotes fold->live when the fold's view is non-terminal and the live
+// store disagrees (root actually closed) — never demotes a fold-reported
+// terminal status, and a store-read failure leaves the fold's view as the
+// answer rather than erroring the whole run lookup.
+func (s *Server) reconcileRunRootAgainstLiveStore(byID map[string]beads.Bead, rootID string) {
+	if cached, ok := byID[rootID]; ok && strings.TrimSpace(cached.Status) == "closed" {
+		return
+	}
+	store := s.state.CityBeadStore()
+	if store == nil {
+		return
+	}
+	live, err := store.Get(rootID)
+	if err != nil || strings.TrimSpace(live.Status) != "closed" {
+		return
+	}
+	byID[rootID] = live
 }
 
 // humaHandleRunSteps is the Huma-typed handler for

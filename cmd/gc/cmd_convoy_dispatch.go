@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -299,11 +300,12 @@ func runControlDispatcherWithStoreAndConfig(cityPath, storePath string, store be
 		if rootID != "" {
 			recorder := openCityRecorderAt(cityPath, stderr)
 			emitErr := executionevent.EmitCurrent(recorder, beads.GraphStore{Store: graphStore}, beads.WorkStore{Store: executionEmitStore(store, cityPath)}, rootID, "control-dispatch")
+			rootCloseErr := emitBeadClosedIfTerminal(recorder, store, rootID)
 			var closeErr error
 			if closer, ok := recorder.(io.Closer); ok {
 				closeErr = closer.Close()
 			}
-			if err := errors.Join(emitErr, closeErr); err != nil {
+			if err := errors.Join(emitErr, rootCloseErr, closeErr); err != nil {
 				fmt.Fprintf(stderr, "warning: control dispatch: projecting execution facts for %s: %v\n", rootID, err) //nolint:errcheck // successful control processing is preserved
 			}
 		}
@@ -316,6 +318,63 @@ func runControlDispatcherWithStoreAndConfig(cityPath, storePath string, store be
 		}
 		fmt.Fprintln(stdout) //nolint:errcheck
 	}
+	return nil
+}
+
+// emitBeadClosedIfTerminal records a "bead.closed" fact for rootID when a
+// control-dispatch operation (typically workflow-finalize) has just closed
+// it. Fixes a real gap: this process opens its mutating store as a bare
+// BdStore (controlBdStoreForRig/City in bd_env.go), never wrapped in a
+// beads.CachingStore — the only thing in this codebase that emits
+// bead.created/updated/closed facts (CachingStore.notifyChange, gated on a
+// wired onChange, internal/beads/caching_store_events.go). The supervisor's
+// own store setup (api_state.go's wrapWithCachingStore) wires that hook;
+// this process never has. So a root this process closes via
+// processWorkflowFinalize (internal/dispatch/runtime.go) can go fully
+// terminal in the bead store while the event-log-only run projection
+// (runFold, internal/api/huma_handlers_runs.go) never hears about it and
+// reports the run "active" forever, updated_at frozen at creation — with no
+// self-healing, since the supervisor's cache prime() silently drops beads
+// that fall out of its open/in_progress scan rather than notifying their
+// closure (confirmed live 2026-08-23: gcas-v7jggb closed 2026-08-22,
+// gcas-3kcuiy closed 2026-08-16, both still "active" days later).
+//
+// This does not attempt full step-level fidelity for the closed subtree
+// (processWorkflowFinalize can force-close many members via
+// molecule.CloseSubtreeWithMetadataExcept, sourceworkflow spec-sidecar
+// cleanup, and source-bead-chain propagation) — only the run ROOT's own
+// terminal status, which is the single fact runproj.CanonicalRunStatusForLane
+// actually reads to decide a run's reported status (root.Status plus its
+// gc.outcome), for both the list and single-run views. Best-effort: a
+// failure here does not affect the control-dispatch result the caller
+// already committed to the store; the caller folds this into the same
+// warning-only error path as the sibling executionevent.EmitCurrent call.
+func emitBeadClosedIfTerminal(recorder events.Recorder, store beads.Store, rootID string) error {
+	if recorder == nil || store == nil || rootID == "" {
+		return nil
+	}
+	root, err := store.Get(rootID)
+	if err != nil {
+		return fmt.Errorf("re-fetching %s for close event: %w", rootID, err)
+	}
+	if strings.TrimSpace(root.Status) != "closed" {
+		return nil
+	}
+	payload, err := json.Marshal(root)
+	if err != nil {
+		return fmt.Errorf("marshaling %s for close event: %w", rootID, err)
+	}
+	stepID := root.Metadata[beadmeta.StepIDMetadataKey]
+	recorder.Record(events.Event{
+		Type:             "bead.closed",
+		Actor:            "control-dispatch",
+		Subject:          root.ID,
+		RunID:            beadmeta.ResolveRunID(root.Metadata, root.ID, ""),
+		SessionID:        root.Metadata[beadmeta.SessionIDMetadataKey],
+		StepID:           stepID,
+		DependsOnStepIDs: beads.NativeStepDependencies(root.Metadata, stepID),
+		Payload:          payload,
+	})
 	return nil
 }
 

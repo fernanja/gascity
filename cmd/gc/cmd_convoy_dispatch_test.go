@@ -7145,3 +7145,69 @@ func TestFollowSleepDurationHandlesPathologicalInputs(t *testing.T) {
 		t.Errorf("followSleepDuration(-1) = %v, want base 1s", got)
 	}
 }
+
+// TestEmitBeadClosedIfTerminalRecordsCloseEvent guards the fix for a real
+// gap: the control-dispatcher opens its mutating store as a bare BdStore
+// (never wrapped in beads.CachingStore, the only thing that emits
+// bead.created/updated/closed facts), so a root it closes via
+// processWorkflowFinalize can go terminal in the store while the event-log
+// run projection (runFold) never hears about it — reporting the run
+// "active" forever (confirmed live 2026-08-23: gcas-v7jggb, gcas-3kcuiy).
+func TestEmitBeadClosedIfTerminalRecordsCloseEvent(t *testing.T) {
+	// NewMemStoreFrom seeds beads verbatim (no Create()-time field
+	// normalization, which unconditionally forces Status to "open") —
+	// needed here to plant an already-closed root directly.
+	store := beads.NewMemStoreFrom(0, []beads.Bead{{
+		ID:     "run-root",
+		Title:  "workflow root",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			beadmeta.OutcomeMetadataKey: beadmeta.OutcomePass,
+		},
+	}}, nil)
+	rec := &memRecorder{}
+	if err := emitBeadClosedIfTerminal(rec, store, "run-root"); err != nil {
+		t.Fatalf("emitBeadClosedIfTerminal: %v", err)
+	}
+	if !rec.hasType("bead.closed") {
+		t.Errorf("recorder events = %+v, want a bead.closed event", rec.events)
+	}
+	if !rec.hasSubject("run-root") {
+		t.Errorf("recorder events = %+v, want subject run-root", rec.events)
+	}
+}
+
+// TestEmitBeadClosedIfTerminalNoOpWhenRootStillOpen guards the "only when
+// actually terminal" half: a control-dispatch op that didn't close the
+// root (most control kinds don't) must not fabricate a close event.
+func TestEmitBeadClosedIfTerminalNoOpWhenRootStillOpen(t *testing.T) {
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{ID: "run-root", Title: "workflow root", Type: "task", Status: "in_progress"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	rec := &memRecorder{}
+	if err := emitBeadClosedIfTerminal(rec, store, root.ID); err != nil {
+		t.Fatalf("emitBeadClosedIfTerminal: %v", err)
+	}
+	if rec.hasType("bead.closed") {
+		t.Errorf("recorder events = %+v, want no bead.closed event for a still-open root", rec.events)
+	}
+}
+
+// TestEmitBeadClosedIfTerminalNoOpOnEmptyInputs guards the nil/empty
+// guard clauses against panics — this runs unconditionally after every
+// control-dispatch call, so it must be inert when there's nothing to do.
+func TestEmitBeadClosedIfTerminalNoOpOnEmptyInputs(t *testing.T) {
+	store := beads.NewMemStore()
+	if err := emitBeadClosedIfTerminal(nil, store, "root"); err != nil {
+		t.Errorf("nil recorder: %v", err)
+	}
+	if err := emitBeadClosedIfTerminal(&memRecorder{}, nil, "root"); err != nil {
+		t.Errorf("nil store: %v", err)
+	}
+	if err := emitBeadClosedIfTerminal(&memRecorder{}, store, ""); err != nil {
+		t.Errorf("empty rootID: %v", err)
+	}
+}
