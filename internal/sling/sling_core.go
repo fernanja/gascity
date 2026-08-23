@@ -467,6 +467,38 @@ func attachedBeadInstructionsDroppedHint(querier BeadQuerier, beadID string, use
 	return fmt.Sprintf("note: bead %s's description is not carried into the formula's rendered context — pass --var context_path=<dir> or --var requirements_path=<doc> to include your instructions, or the formula's brainstorm will not see them.", beadID)
 }
 
+// autoCarryBeadDescriptionVar makes the target bead's own Description
+// available to the formula's rendered context as {{desc}}, for formulas
+// that declare a "desc" var (internal/formula/compile.go's rootDesc
+// handling substitutes it into the wisp root's own description). Without
+// this, an attached bead's instructions are silently invisible to every
+// formula unless the caller passes --var context_path/requirements_path
+// explicitly — see attachedBeadInstructionsDroppedHint, whose warning
+// still fires regardless (desc only reaches the wisp root, not
+// necessarily a deep step several hops into the graph, so the warning
+// stays a conservative "did you mean to carry more context in" signal).
+// No-ops if desc, context_path, or requirements_path is already set
+// explicitly, or if the bead has no description — so for the many
+// formulas that never declare a "desc" var, this is a pure no-op
+// (formula.Substitute leaves unmatched {{name}} placeholders untouched).
+func autoCarryBeadDescriptionVar(vars map[string]string, querier BeadQuerier, beadID string) {
+	if vars == nil || querier == nil || beadID == "" {
+		return
+	}
+	if vars["desc"] != "" || vars["context_path"] != "" || vars["requirements_path"] != "" {
+		return
+	}
+	bead, err := querier.Get(beadID)
+	if err != nil {
+		return
+	}
+	desc := strings.TrimSpace(bead.Description)
+	if desc == "" {
+		return
+	}
+	vars["desc"] = bead.Description
+}
+
 // slingDefaultFormula handles the default formula attachment path.
 func slingDefaultFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID string, result SlingResult) (SlingResult, error) {
 	result, err := attachFormulaToBead(opts, deps, querier, beadID, opts.Target.EffectiveDefaultSlingFormula(), "default-on-formula", "default formula", result)
@@ -496,6 +528,7 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 	}
 	if isGraph {
 		formulaVars = graphInv.Vars
+		autoCarryBeadDescriptionVar(formulaVars, querier, beadID)
 		result.Deprecations = append(result.Deprecations, graphInv.Deprecations...)
 		if err := validateSlingFormulaRuntimeVars(context.Background(), formulaName, searchPaths, molecule.Options{
 			Title: opts.Title,
@@ -566,6 +599,7 @@ func attachFormulaToBead(opts SlingOpts, deps SlingDeps, querier BeadQuerier, be
 	}); err != nil {
 		return result, fmt.Errorf("instantiating %s %q on %s: %w", errLabel, formulaName, beadID, err)
 	}
+	autoCarryBeadDescriptionVar(formulaVars, querier, beadID)
 	// The graph path returned above, so this is the legacy (non-graph) region:
 	// isGraph is always false here, so the former `isGraph && opts.Force`
 	// live-workflow allowance could never fire. Attachments are always checked

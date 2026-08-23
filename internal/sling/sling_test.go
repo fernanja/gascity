@@ -2502,6 +2502,128 @@ func TestSlingAttachFormulaNoWarningWhenBeadHasNoDescription(t *testing.T) {
 	}
 }
 
+// TestSlingAttachFormulaAutoCarriesBeadDescriptionAsDescVar guards the
+// #3681 fix: a formula that declares a "desc" var receives the attached
+// bead's own Description as {{desc}}, landing in the wisp root's
+// rendered Description — without the caller having to pass
+// --var context_path/requirements_path. Legacy (v1) formula path.
+func TestSlingAttachFormulaAutoCarriesBeadDescriptionAsDescVar(t *testing.T) {
+	formulaDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(formulaDir, "desc-formula.toml"), []byte(`
+formula = "desc-formula"
+version = 1
+description = "{{desc}}"
+
+[vars.desc]
+description = "Carried-in description"
+required = false
+
+[[steps]]
+id = "work"
+title = "Work"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test"},
+		FormulaLayers: config.FormulaLayers{City: []string{formulaDir}},
+	}
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task", Description: "fix the thing that broke"})
+
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	result, err := s.AttachFormula(context.Background(), "desc-formula", b.ID, a, FormulaOpts{})
+	if err != nil {
+		t.Fatalf("AttachFormula: %v", err)
+	}
+	root, err := deps.Store.Get(result.WispRootID)
+	if err != nil {
+		t.Fatalf("Get(root): %v", err)
+	}
+	if root.Description != "fix the thing that broke" {
+		t.Errorf("root.Description = %q, want the attached bead's own description", root.Description)
+	}
+}
+
+// TestSlingAttachGraphFormulaAutoCarriesBeadDescriptionAsDescVar is the
+// graph.v2 counterpart: formulaVars gets reassigned to graphInv.Vars
+// before the graph branch renders, so the auto-carry must apply to that
+// reassigned map too, not just the pre-graph-check map used by the
+// legacy fallthrough.
+func TestSlingAttachGraphFormulaAutoCarriesBeadDescriptionAsDescVar(t *testing.T) {
+	formulaDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(formulaDir, "graph-desc.formula.toml"), []byte(`
+formula = "graph-desc"
+version = 2
+contract = "graph.v2"
+description = "{{desc}}"
+
+[vars.desc]
+description = "Carried-in description"
+required = false
+
+[[steps]]
+id = "step"
+title = "Do work for {{convoy_id}}"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := graphV2SlingTestConfig(t, formulaDir)
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	source, err := deps.Store.Create(beads.Bead{Title: "work", Type: "task", Status: "open", Description: "fix the thing that broke"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := s.AttachFormula(context.Background(), "graph-desc", source.ID, config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}, FormulaOpts{})
+	if err != nil {
+		t.Fatalf("AttachFormula: %v", err)
+	}
+	root, err := deps.Store.Get(result.WorkflowID)
+	if err != nil {
+		t.Fatalf("Get(root): %v", err)
+	}
+	if root.Description != "fix the thing that broke" {
+		t.Errorf("root.Description = %q, want the attached bead's own description", root.Description)
+	}
+}
+
+// TestSlingAttachFormulaDescVarNoOpWhenFormulaDoesNotDeclareIt guards the
+// safety property that autoCarryBeadDescriptionVar is a pure no-op for
+// the many formulas that never reference {{desc}}: the wisp root keeps
+// the formula's own static description, unchanged.
+func TestSlingAttachFormulaDescVarNoOpWhenFormulaDoesNotDeclareIt(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task", Description: "fix the thing that broke"})
+
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	result, err := s.AttachFormula(context.Background(), "code-review", b.ID, a, FormulaOpts{})
+	if err != nil {
+		t.Fatalf("AttachFormula: %v", err)
+	}
+	root, err := deps.Store.Get(result.WispRootID)
+	if err != nil {
+		t.Fatalf("Get(root): %v", err)
+	}
+	if root.Description == "fix the thing that broke" {
+		t.Errorf("root.Description = %q, want the formula's own static description (code-review declares no desc var)", root.Description)
+	}
+}
+
 func TestSlingAttachFormulaRejectsMissingBead(t *testing.T) {
 	runner := newFakeRunner()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
