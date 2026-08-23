@@ -14,7 +14,9 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/formula"
+	"github.com/gastownhall/gascity/internal/graphv2"
 	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 )
@@ -871,6 +873,9 @@ func processWorkflowFinalize(store beads.Store, bead beads.Bead, opts ProcessOpt
 		if err := closeSourceBeadChain(store, rootID, opts); err != nil {
 			return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: closing source bead chain: %w", rootID, err))
 		}
+		if err := closeInputConvoyMembers(store, rootID); err != nil {
+			return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: closing input convoy: %w", rootID, err))
+		}
 	}
 	if err := setOutcomeAndClose(store, bead.ID, beadmeta.OutcomePass); err != nil {
 		return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: completing workflow finalizer: %w", bead.ID, err))
@@ -939,6 +944,67 @@ func preflightSourceBeadChain(rootStore beads.Store, rootID string, opts Process
 // disappear from the human-visible queue once the rig-scope workflow merges.
 func closeSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOptions) error {
 	return walkSourceBeadChain(rootStore, rootID, opts, true)
+}
+
+// closeInputConvoyMembers closes the tracked member(s) of rootID's input
+// convoy, then the convoy itself, when that convoy is a single-item
+// synthetic input convoy created by an --on/default-formula sling attach
+// (internal/sling/sling_core.go's attachFormulaToBead, convoy-first branch).
+// Graph.v2 work beads deliberately carry no gc.source_bead_id (see that
+// function's own comment), so closeSourceBeadChain above never reaches
+// them — this is the parallel path for that linkage. Pass-only, same as
+// closeSourceBeadChain: a failed workflow leaves its original bead open so
+// a human can investigate — the bead IS the audit handle.
+//
+// Deliberately excludes drain-unit convoys, which must stay open after a
+// single drained item's success — they are lineage/input containers for
+// the rest of the drain, not a per-item completion signal (see
+// engdocs/design/convoy-first-formulas-and-drain-v0.md and
+// internal/dispatch/drain.go's ensureDrainUnitConvoy, which stamps
+// gc.synthetic_kind=drain-unit-convoy alongside gc.synthetic=true). The
+// guard below requires synthetic_kind to be unset, which single-item input
+// convoys never set (internal/graphv2/invocation.go's
+// CreateSingleItemInputConvoy) — the only two shapes that ever set
+// gc.synthetic in this codebase, confirmed by full-repo grep.
+//
+// Closes the gap tracked as gascity#3986 without that issue's proposed fix
+// (stamping gc.source_bead_id on graph.v2 roots), which would conflict with
+// the v0 doc's explicit rule against that and with
+// cmd/gc/wisp_autoclose.go's discriminator between graph and legacy
+// workflow roots (a root with no gc.source_bead_id is assumed graph.v2 and
+// reaped via gc.input_convoy_id instead; stamping the key would blur that).
+func closeInputConvoyMembers(store beads.Store, rootID string) error {
+	root, err := store.Get(rootID)
+	if err != nil {
+		return fmt.Errorf("re-fetching %s for input-convoy close: %w", rootID, err)
+	}
+	convoyID := strings.TrimSpace(root.Metadata[beadmeta.InputConvoyIDMetadataKey])
+	if convoyID == "" {
+		return nil
+	}
+	convoyBead, err := store.Get(convoyID)
+	if err != nil {
+		return fmt.Errorf("fetching input convoy %s: %w", convoyID, err)
+	}
+	if convoyBead.Type != "convoy" ||
+		strings.TrimSpace(convoyBead.Metadata[beadmeta.SyntheticMetadataKey]) != "true" ||
+		strings.TrimSpace(convoyBead.Metadata[beadmeta.SyntheticKindMetadataKey]) != "" {
+		return nil
+	}
+	members, err := convoy.Members(store, convoyID, false)
+	if err != nil {
+		return fmt.Errorf("listing members of input convoy %s: %w", convoyID, err)
+	}
+	for _, m := range members {
+		if m.ID == rootID || strings.TrimSpace(m.Status) == "closed" {
+			continue
+		}
+		if err := closeSourceBeadPreservingOutcome(store, m); err != nil {
+			return fmt.Errorf("closing input-convoy member %s: %w", m.ID, err)
+		}
+	}
+	graphv2.CloseSyntheticInputConvoy(store, convoyID, rootID)
+	return nil
 }
 
 func walkSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOptions, mutate bool) error {

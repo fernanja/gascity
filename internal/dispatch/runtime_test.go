@@ -19,6 +19,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/convergence"
+	"github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/formulatest"
 	"github.com/gastownhall/gascity/internal/molecule"
@@ -2355,6 +2356,227 @@ func TestProcessWorkflowFinalizeClosesWorkflow(t *testing.T) {
 	}
 	if got := rootAfter.Metadata["gc.outcome"]; got != "fail" {
 		t.Fatalf("workflow outcome = %q, want fail", got)
+	}
+}
+
+// mustCreateSingleItemInputConvoy builds the exact shape
+// internal/graphv2/invocation.go's CreateSingleItemInputConvoy produces: a
+// convoy bead with gc.synthetic=true (no gc.synthetic_kind), tracking one
+// member via convoy.TrackItem.
+func mustCreateSingleItemInputConvoy(t *testing.T, store beads.Store, memberID string) beads.Bead {
+	t.Helper()
+	convoyBead, err := store.Create(beads.Bead{
+		Title:    "input convoy",
+		Type:     "convoy",
+		Metadata: map[string]string{"gc.synthetic": "true"},
+	})
+	if err != nil {
+		t.Fatalf("create input convoy: %v", err)
+	}
+	if err := convoy.TrackItem(store, convoyBead.ID, memberID); err != nil {
+		t.Fatalf("track %s in convoy %s: %v", memberID, convoyBead.ID, err)
+	}
+	return convoyBead
+}
+
+// TestProcessWorkflowFinalizeClosesInputConvoyMemberOnPass guards the
+// #3986/gascity-mayor fix: a graph.v2 workflow root attached via --on
+// carries no gc.source_bead_id (so closeSourceBeadChain never reaches the
+// original bead), only gc.input_convoy_id pointing at a synthetic
+// single-item convoy tracking that bead. On a passing finalize, both the
+// tracked member and the convoy itself must close.
+func TestProcessWorkflowFinalizeClosesInputConvoyMemberOnPass(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	original := mustCreateWorkflowBead(t, store, beads.Bead{Title: "original bug bead", Type: "bug"})
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	convoyBead := mustCreateSingleItemInputConvoy(t, store, original.ID)
+	if err := store.SetMetadata(workflow.ID, "gc.input_convoy_id", convoyBead.ID); err != nil {
+		t.Fatalf("set gc.input_convoy_id: %v", err)
+	}
+	finalizer := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:    "Finalize workflow",
+		Type:     "task",
+		Metadata: map[string]string{"gc.kind": "workflow-finalize", "gc.root_bead_id": workflow.ID},
+	})
+	mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+
+	result, err := ProcessControl(store, finalizer, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if !result.Processed || result.Action != "workflow-pass" {
+		t.Fatalf("result = %+v, want processed workflow-pass", result)
+	}
+
+	originalAfter, err := store.Get(original.ID)
+	if err != nil {
+		t.Fatalf("get original: %v", err)
+	}
+	if originalAfter.Status != "closed" {
+		t.Fatalf("original bead status = %q, want closed", originalAfter.Status)
+	}
+	convoyAfter, err := store.Get(convoyBead.ID)
+	if err != nil {
+		t.Fatalf("get convoy: %v", err)
+	}
+	if convoyAfter.Status != "closed" {
+		t.Fatalf("convoy status = %q, want closed", convoyAfter.Status)
+	}
+}
+
+// TestProcessWorkflowFinalizeLeavesInputConvoyOpenOnFail guards the
+// pass-only scope, mirroring closeSourceBeadChain's own precedent: a failed
+// workflow must leave its original bead open so a human can investigate —
+// the bead IS the audit handle.
+func TestProcessWorkflowFinalizeLeavesInputConvoyOpenOnFail(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	original := mustCreateWorkflowBead(t, store, beads.Bead{Title: "original bug bead", Type: "bug"})
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:    "workflow",
+		Type:     "task",
+		Metadata: map[string]string{"gc.kind": "workflow", "gc.formula_contract": "graph.v2"},
+	})
+	cleanup := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "cleanup", Type: "task", Status: "closed",
+		Metadata: map[string]string{"gc.outcome": "fail"},
+	})
+	convoyBead := mustCreateSingleItemInputConvoy(t, store, original.ID)
+	if err := store.SetMetadata(workflow.ID, "gc.input_convoy_id", convoyBead.ID); err != nil {
+		t.Fatalf("set gc.input_convoy_id: %v", err)
+	}
+	finalizer := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:    "Finalize workflow",
+		Type:     "task",
+		Metadata: map[string]string{"gc.kind": "workflow-finalize", "gc.root_bead_id": workflow.ID},
+	})
+	mustDepAdd(t, store, finalizer.ID, cleanup.ID, "blocks")
+	mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+
+	result, err := ProcessControl(store, finalizer, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if result.Action != "workflow-fail" {
+		t.Fatalf("result = %+v, want workflow-fail", result)
+	}
+
+	originalAfter, err := store.Get(original.ID)
+	if err != nil {
+		t.Fatalf("get original: %v", err)
+	}
+	if originalAfter.Status == "closed" {
+		t.Fatalf("original bead status = %q, want left open on failure (audit handle)", originalAfter.Status)
+	}
+	convoyAfter, err := store.Get(convoyBead.ID)
+	if err != nil {
+		t.Fatalf("get convoy: %v", err)
+	}
+	if convoyAfter.Status == "closed" {
+		t.Fatalf("convoy status = %q, want left open on failure", convoyAfter.Status)
+	}
+}
+
+// TestProcessWorkflowFinalizeDoesNotCloseDrainUnitConvoyMember guards the
+// landmine identified during review: a drain-unit convoy (gc.synthetic=true
+// PLUS gc.synthetic_kind=drain-unit-convoy — internal/dispatch/drain.go's
+// ensureDrainUnitConvoy) must stay open, and its tracked member must not be
+// force-closed, even though it matches gc.synthetic=="true" the same way a
+// single-item input convoy does. Only the synthetic_kind=="" shape qualifies.
+func TestProcessWorkflowFinalizeDoesNotCloseDrainUnitConvoyMember(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	drainedItem := mustCreateWorkflowBead(t, store, beads.Bead{Title: "drained item", Type: "bug"})
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:    "workflow",
+		Type:     "task",
+		Metadata: map[string]string{"gc.kind": "workflow", "gc.formula_contract": "graph.v2"},
+	})
+	drainUnitConvoy, err := store.Create(beads.Bead{
+		Title: "drain unit convoy",
+		Type:  "convoy",
+		Metadata: map[string]string{
+			"gc.synthetic":      "true",
+			"gc.synthetic_kind": "drain-unit-convoy",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create drain-unit convoy: %v", err)
+	}
+	if err := convoy.TrackItem(store, drainUnitConvoy.ID, drainedItem.ID); err != nil {
+		t.Fatalf("track drained item: %v", err)
+	}
+	if err := store.SetMetadata(workflow.ID, "gc.input_convoy_id", drainUnitConvoy.ID); err != nil {
+		t.Fatalf("set gc.input_convoy_id: %v", err)
+	}
+	finalizer := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:    "Finalize workflow",
+		Type:     "task",
+		Metadata: map[string]string{"gc.kind": "workflow-finalize", "gc.root_bead_id": workflow.ID},
+	})
+	mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+
+	result, err := ProcessControl(store, finalizer, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if result.Action != "workflow-pass" {
+		t.Fatalf("result = %+v, want workflow-pass", result)
+	}
+
+	itemAfter, err := store.Get(drainedItem.ID)
+	if err != nil {
+		t.Fatalf("get drained item: %v", err)
+	}
+	if itemAfter.Status == "closed" {
+		t.Fatalf("drained item status = %q, want left open — drain-unit convoys are lineage containers, not a per-item completion signal", itemAfter.Status)
+	}
+	convoyAfter, err := store.Get(drainUnitConvoy.ID)
+	if err != nil {
+		t.Fatalf("get drain-unit convoy: %v", err)
+	}
+	if convoyAfter.Status == "closed" {
+		t.Fatalf("drain-unit convoy status = %q, want left open", convoyAfter.Status)
+	}
+}
+
+// TestProcessWorkflowFinalizeNoInputConvoyIsNoOp guards the common case —
+// most workflow roots (fresh build-basic/build-from-plan launches, not
+// --on-attached) carry no gc.input_convoy_id at all — against a spurious
+// error from the new code path.
+func TestProcessWorkflowFinalizeNoInputConvoyIsNoOp(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:    "workflow",
+		Type:     "task",
+		Metadata: map[string]string{"gc.kind": "workflow", "gc.formula_contract": "graph.v2"},
+	})
+	finalizer := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:    "Finalize workflow",
+		Type:     "task",
+		Metadata: map[string]string{"gc.kind": "workflow-finalize", "gc.root_bead_id": workflow.ID},
+	})
+	mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+
+	result, err := ProcessControl(store, finalizer, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if result.Action != "workflow-pass" {
+		t.Fatalf("result = %+v, want workflow-pass", result)
 	}
 }
 
