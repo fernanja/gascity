@@ -12215,6 +12215,194 @@ func TestRepairControlDispatcherRoutesDoesNotGuessUnscopedControlOwnership(t *te
 	}
 }
 
+// TestRepairControlDispatcherRoutesClearsStaleWorkflowRootRoute pins the
+// gc-1vjyt fix: once a workflow root's graph has expanded and every real step
+// has closed — only its workflow-finalize control descendant remains open —
+// the root's stale gc.routed_to must be cleared. Uncleared, the root stays
+// open+unassigned+routed forever (finalize is driven by the control-dispatcher,
+// a different pool than the root's run-operator route), so the next
+// run-operator poll claims it again with no real work to find, which is
+// exactly the self-fail/infinite-retry loop gc-1vjyt describes.
+func TestRepairControlDispatcherRoutesClearsStaleWorkflowRootRoute(t *testing.T) {
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title:  "build-from-plan",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:     beadmeta.KindWorkflow,
+			beadmeta.RoutedToMetadataKey: "ascent/gc.run-operator",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+	step, err := store.Create(beads.Bead{
+		Title:  "Implement owned work",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.RootBeadIDMetadataKey: root.ID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create step: %v", err)
+	}
+	if err := store.Close(step.ID); err != nil {
+		t.Fatalf("close step: %v", err)
+	}
+	finalize, err := store.Create(beads.Bead{
+		Title:  "Finalize workflow",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:       beadmeta.KindWorkflowFinalize,
+			beadmeta.RootBeadIDMetadataKey: root.ID,
+			beadmeta.RoutedToMetadataKey:   "ascent/core.control-dispatcher",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create finalize: %v", err)
+	}
+
+	work := []beads.Bead{root}
+	repairControlDispatcherRoutesForStoreScope(
+		t.TempDir(),
+		&config.City{Workspace: config.Workspace{Name: "test-city"}},
+		work,
+		[]beads.Store{store},
+		[]string{"rig:fixture"},
+		io.Discard,
+	)
+
+	stored, err := store.Get(root.ID)
+	if err != nil {
+		t.Fatalf("get root: %v", err)
+	}
+	if got := stored.Metadata[beadmeta.RoutedToMetadataKey]; got != "" {
+		t.Fatalf("stored root gc.routed_to = %q, want cleared once only finalize remains open", got)
+	}
+	if got := work[0].Metadata[beadmeta.RoutedToMetadataKey]; got != "" {
+		t.Fatalf("in-memory root gc.routed_to = %q, want cleared once only finalize remains open", got)
+	}
+
+	// The finalize bead's own route is untouched — clearing the root's route
+	// must not collaterally disturb the control-dispatcher's own routing.
+	finalizeStored, err := store.Get(finalize.ID)
+	if err != nil {
+		t.Fatalf("get finalize: %v", err)
+	}
+	if got := finalizeStored.Metadata[beadmeta.RoutedToMetadataKey]; got != "ascent/core.control-dispatcher" {
+		t.Fatalf("finalize gc.routed_to = %q, want unchanged", got)
+	}
+}
+
+// TestRepairControlDispatcherRoutesLeavesWorkflowRootRouteWhileRealWorkOpen
+// is the control on the gc-1vjyt fix: a workflow root with a real, open,
+// non-control step must keep its route, so the run-operator pool stays able
+// to claim the root and keep driving the workflow forward.
+func TestRepairControlDispatcherRoutesLeavesWorkflowRootRouteWhileRealWorkOpen(t *testing.T) {
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title:  "build-from-plan",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:     beadmeta.KindWorkflow,
+			beadmeta.RoutedToMetadataKey: "ascent/gc.run-operator",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:  "Implement owned work",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.RootBeadIDMetadataKey: root.ID,
+		},
+	}); err != nil {
+		t.Fatalf("create step: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:  "Finalize workflow",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:       beadmeta.KindWorkflowFinalize,
+			beadmeta.RootBeadIDMetadataKey: root.ID,
+			beadmeta.RoutedToMetadataKey:   "ascent/core.control-dispatcher",
+		},
+	}); err != nil {
+		t.Fatalf("create finalize: %v", err)
+	}
+
+	work := []beads.Bead{root}
+	repairControlDispatcherRoutesForStoreScope(
+		t.TempDir(),
+		&config.City{Workspace: config.Workspace{Name: "test-city"}},
+		work,
+		[]beads.Store{store},
+		[]string{"rig:fixture"},
+		io.Discard,
+	)
+
+	stored, err := store.Get(root.ID)
+	if err != nil {
+		t.Fatalf("get root: %v", err)
+	}
+	if got := stored.Metadata[beadmeta.RoutedToMetadataKey]; got != "ascent/gc.run-operator" {
+		t.Fatalf("stored root gc.routed_to = %q, want unchanged while a real step is still open", got)
+	}
+	if got := work[0].Metadata[beadmeta.RoutedToMetadataKey]; got != "ascent/gc.run-operator" {
+		t.Fatalf("in-memory root gc.routed_to = %q, want unchanged while a real step is still open", got)
+	}
+}
+
+// TestRepairControlDispatcherRoutesLeavesFreshWorkflowRootRouteAlone protects
+// #2763: a just-dispatched workflow root has gc.routed_to stamped but no
+// descendants yet (the graph hasn't been expanded — that happens on the
+// root's own first claim). The repair sweep must not clear that route, or
+// the root would never receive its legitimate first claim and would sit idle
+// until scale_check reaps it.
+func TestRepairControlDispatcherRoutesLeavesFreshWorkflowRootRouteAlone(t *testing.T) {
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title:  "build-from-plan",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			beadmeta.KindMetadataKey:     beadmeta.KindWorkflow,
+			beadmeta.RoutedToMetadataKey: "ascent/gc.run-operator",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+
+	work := []beads.Bead{root}
+	repairControlDispatcherRoutesForStoreScope(
+		t.TempDir(),
+		&config.City{Workspace: config.Workspace{Name: "test-city"}},
+		work,
+		[]beads.Store{store},
+		[]string{"rig:fixture"},
+		io.Discard,
+	)
+
+	stored, err := store.Get(root.ID)
+	if err != nil {
+		t.Fatalf("get root: %v", err)
+	}
+	if got := stored.Metadata[beadmeta.RoutedToMetadataKey]; got != "ascent/gc.run-operator" {
+		t.Fatalf("stored root gc.routed_to = %q, want unchanged before the graph has any descendants", got)
+	}
+	if got := work[0].Metadata[beadmeta.RoutedToMetadataKey]; got != "ascent/gc.run-operator" {
+		t.Fatalf("in-memory root gc.routed_to = %q, want unchanged before the graph has any descendants", got)
+	}
+}
+
 func TestBuildDesiredState_RepairsRigRoutedCityControlWork(t *testing.T) {
 	cityPath := t.TempDir()
 	cityStore := beads.NewMemStore()

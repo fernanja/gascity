@@ -16,12 +16,16 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	convoycore "github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/graphroute"
 	"github.com/gastownhall/gascity/internal/hooks"
+	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/poolplan"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/sourceworkflow"
 	"github.com/gastownhall/gascity/internal/storeref"
 	"github.com/gastownhall/gascity/internal/suspensionstate"
 	workdirutil "github.com/gastownhall/gascity/internal/workdir"
@@ -5040,7 +5044,12 @@ func newControlDispatcherRouteRepair(cfg *config.City, stderr io.Writer) *contro
 // Graph v2 stamped gc.root_store_ref before that regression, so malformed/older
 // rows are left untouched instead of guessing a store.
 func (r *controlDispatcherRouteRepair) repairBead(bead *beads.Bead, store beads.Store, storeRef string) {
-	if !beadmeta.IsControlKind(strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey])) {
+	kind := strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey])
+	if kind == beadmeta.KindWorkflow {
+		r.repairWorkflowRootRoute(bead, store)
+		return
+	}
+	if !beadmeta.IsControlKind(kind) {
 		return
 	}
 	if _, scoped := storeref.ScopeRigContext(bead.Metadata[beadmeta.RootStoreRefMetadataKey]); !scoped {
@@ -5057,6 +5066,99 @@ func (r *controlDispatcherRouteRepair) repairBead(bead *beads.Bead, store beads.
 		return
 	}
 	r.persist(bead, store, current, route, needsRouteRepair, clearFallback)
+}
+
+// repairWorkflowRootRoute clears a workflow root's stale gc.routed_to once its
+// graph has been expanded and no real (non-control, non-topology) descendant
+// remains open — the gc-1vjyt fingerprint.
+//
+// DecorateGraphWorkflowRecipe (internal/graphroute) stamps gc.routed_to on the
+// root unconditionally so its legitimate first claim — the one that expands
+// the graph into real steps — is not idle-reaped by scale_check (#2763). That
+// routing is never revoked afterward. A pool-routed root cycles back to
+// open+unassigned between claims by design (run-operators claim it, drive
+// whatever step is next, and release), which is fine while real step work
+// remains. But once every real step has closed and only a control descendant
+// (workflow-finalize, which a DIFFERENT dispatcher — the control-dispatcher,
+// not the run-operator pool — drives to completion) is still open, the root
+// is STILL open+unassigned+routed, so the next run-operator poll claims it
+// again with no real work to find. Some workers self-fail the whole workflow
+// in response (closes outcome=fail, and the reconciler treats that as
+// "retry", spawning a duplicate that hits the identical wall); others just
+// sit claimed-but-idle. Either way, forward progress stops.
+//
+// Clearing the route here — the same bounded, budgeted sweep that already
+// repairs stale control-bead routes — is the minimal fix: it does not touch
+// #2763's legitimate first claim (a freshly-dispatched root has no
+// descendants yet, so subtreeHasOpenNonControlWork's descendants==0 guard
+// leaves it alone), and it does not touch a root with real work still
+// pending (the root stays claimable so the run-operator keeps driving it).
+// It only revokes routing in the narrow window where the only thing left for
+// this workflow is a finalize (or other control-kind) step outside the
+// run-operator's remit.
+func (r *controlDispatcherRouteRepair) repairWorkflowRootRoute(bead *beads.Bead, store beads.Store) {
+	current := strings.TrimSpace(bead.Metadata[beadmeta.RoutedToMetadataKey])
+	if current == "" {
+		return
+	}
+	if store == nil {
+		return
+	}
+	hasOpenNonControlWork, descendants := subtreeHasOpenNonControlWork(store, bead.ID)
+	if descendants == 0 {
+		// No graph-expansion evidence yet (or a transient subtree-walk
+		// failure, which subtreeHasOpenNonControlWork also reports via
+		// hasOpenNonControlWork=true — never reached here). Leave the
+		// legitimate first-claim routing alone.
+		return
+	}
+	if hasOpenNonControlWork {
+		return
+	}
+	if r.writesRemaining <= 0 {
+		deferRouteRepair(bead, true)
+		return
+	}
+	r.persist(bead, store, current, "", true, false)
+}
+
+// subtreeHasOpenNonControlWork reports whether the subtree rooted at rootID
+// (root excluded) has any open descendant that is neither a control kind
+// (beadmeta.IsControlKind — workflow-finalize, retry, etc., which the
+// control-dispatcher drives) nor a workflow-topology kind
+// (graphroute.IsWorkflowTopologyKind — nested scope/spec latches) nor a
+// generated spec sidecar (sourceworkflow.IsGeneratedSpecSidecar). Such a
+// descendant is real step work a run-operator still needs to drive.
+//
+// A subtree-walk error fails safe: it reports hasOpenNonControlWork=true so
+// the caller leaves the root's routing untouched rather than risk clearing it
+// while real work might still be pending. descendants counts every
+// non-root, non-sidecar member seen (regardless of status or kind) so the
+// caller can distinguish "walked fine, nothing found" (root not yet
+// expanded) from "walked fine, everything left is control/topology work."
+func subtreeHasOpenNonControlWork(store beads.Store, rootID string) (hasOpenNonControlWork bool, descendants int) {
+	subtree, err := molecule.ListSubtree(store, rootID)
+	if err != nil {
+		return true, 0
+	}
+	for _, b := range subtree {
+		if b.ID == rootID {
+			continue
+		}
+		if sourceworkflow.IsGeneratedSpecSidecar(b) {
+			continue
+		}
+		descendants++
+		if convoycore.IsTerminalStatus(b.Status) {
+			continue
+		}
+		kind := strings.TrimSpace(b.Metadata[beadmeta.KindMetadataKey])
+		if beadmeta.IsControlKind(kind) || graphroute.IsWorkflowTopologyKind(kind) {
+			continue
+		}
+		return true, descendants
+	}
+	return false, descendants
 }
 
 // desiredRoute returns the configured control-dispatcher route for the bead's
