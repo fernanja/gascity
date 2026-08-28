@@ -166,6 +166,29 @@ SYNCED=0
 FAILED=0
 FAILED_DBS=""
 
+STALE_MANIFEST_DBS=""
+
+# check_manifest_staleness compares the destination manifest's mtime against
+# every other file under its backup dir. `dolt backup sync` exiting 0 only
+# proves the command didn't error -- it does NOT prove the manifest (the
+# pointer to the current backup HEAD) actually advanced. Observed live
+# 2026-08-27/28: dolt backup sync ran successfully on schedule for 65h+,
+# writing fresh content-addressed chunks each cycle, while the manifest
+# itself silently stopped advancing days earlier -- the freshness-stamping
+# order (which reads manifest mtime) correctly reported staleness the whole
+# time, but nothing in this script itself ever surfaced *why* (gc-13tam3).
+# A file newer than the manifest means real content landed but the pointer
+# to it never committed -- the exact silent-partial-sync signature.
+check_manifest_staleness() {
+    manifest_db="$1"
+    manifest_path="$BACKUP_ARTIFACT_DIR/$manifest_db/manifest"
+    [ -f "$manifest_path" ] || return 0
+    newer_count=$(find "$BACKUP_ARTIFACT_DIR/$manifest_db" -type f -newer "$manifest_path" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${newer_count:-0}" -gt 0 ]; then
+        STALE_MANIFEST_DBS="$STALE_MANIFEST_DBS $manifest_db"
+    fi
+}
+
 for db in $DATABASES; do
     if ! ensure_backup_remote "$db"; then
         append_failed_db "$db(backup add failed)"
@@ -176,10 +199,14 @@ for db in $DATABASES; do
         append_failed_db "$db(not found)"
         continue
     fi
-    if (cd "$db_dir" && run_bounded 120 dolt backup sync "${db}-backup" 2>/dev/null); then
+    if sync_err=$(cd "$db_dir" && run_bounded 120 dolt backup sync "${db}-backup" 2>&1); then
         SYNCED=$((SYNCED + 1))
+        check_manifest_staleness "$db"
     else
         append_failed_db "$db(sync failed)"
+        # Surface dolt's own stderr instead of discarding it -- a silent exit
+        # code alone was never enough to diagnose what actually went wrong.
+        [ -n "$sync_err" ] && echo "backup: $db sync error: $sync_err" >&2
     fi
 done
 
@@ -209,6 +236,14 @@ if [ "$FAILED_COUNT" -gt 0 ]; then
         2>/dev/null || true
 fi
 
-SUMMARY="backup — synced: $SYNCED/$TOTAL, offsite: $OFFSITE_STATUS"
+if [ -n "$STALE_MANIFEST_DBS" ]; then
+    dolt_escalate \
+        "Dolt backup: manifest not advancing despite successful sync exit [HIGH]" \
+        "dolt backup sync reported success for:$STALE_MANIFEST_DBS, but each database's backup manifest is older than other files in its own backup dir -- new content is being written without the manifest pointer ever committing to it. Backups for these databases are not actually current despite the sync command succeeding. Check dolt backup sync's own stderr output above (no longer suppressed) for the real cause (likely contention against a live, actively-written source database)." \
+        2>/dev/null || true
+fi
+
+STALE_COUNT=$(printf '%s\n' "$STALE_MANIFEST_DBS" | wc -w | tr -d ' ')
+SUMMARY="backup — synced: $SYNCED/$TOTAL, stale-manifest: $STALE_COUNT, offsite: $OFFSITE_STATUS"
 dolt_notify_done "$SUMMARY"
 echo "backup: $SUMMARY"

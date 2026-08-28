@@ -15,11 +15,17 @@ const supervisorWrites: Array<{
   path: string;
   body?: unknown;
 }> = [];
+let beadItems: ReadonlyArray<SupervisorBead> = [];
+
+function setBeadItems(items: ReadonlyArray<SupervisorBead>): void {
+  beadItems = items;
+}
 
 beforeEach(() => {
   setActiveCity('test-city');
   beadQueries.length = 0;
   supervisorWrites.length = 0;
+  beadItems = [sampleBead()];
   invalidate('beads:board:');
   invalidate('sessions');
   invalidate('agents');
@@ -31,7 +37,7 @@ beforeEach(() => {
       const method = requestMethod(input, init);
       if (url.pathname === '/v0/city/test-city/beads' && method === 'GET') {
         beadQueries.push(url.searchParams);
-        return jsonResponse(beadListPayload(url.searchParams.has('type') ? [] : [sampleBead()]));
+        return jsonResponse(beadListPayload(url.searchParams.has('type') ? [] : beadItems));
       }
       if (url.pathname === '/v0/city/test-city/beads' && method === 'POST') {
         supervisorWrites.push({
@@ -288,6 +294,28 @@ describe('BeadsPage', () => {
       ]);
     });
   });
+
+  it('hides gc:-labeled bookkeeping beads by default and reveals them via the system beads toggle', async () => {
+    // Mirrors a real Slack extmsg-membership bead (gc-0mf66f/gc-sbcakf
+    // investigation session, 2026-08-28): issue_type=task so it clears
+    // ENGINEERING_BEAD_TYPES, but a gc:-prefixed label marks it as durable
+    // system plumbing, not outstanding work.
+    setBeadItems([sampleBead(), bookkeepingBead()]);
+    renderPage();
+
+    await screen.findByText('Sample bead');
+    expect(screen.queryByText('Slack membership binding')).toBeNull();
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /system beads/i }));
+
+    await screen.findByText('Slack membership binding');
+    expect(screen.getByText('Sample bead')).toBeTruthy();
+
+    // Toggling back off hides it again without a fresh fetch (the filter is
+    // client-side over the same already-loaded row set).
+    fireEvent.click(screen.getByRole('checkbox', { name: /system beads/i }));
+    await waitFor(() => expect(screen.queryByText('Slack membership binding')).toBeNull());
+  });
 });
 
 function renderPage(path = '/beads') {
@@ -339,6 +367,18 @@ function sampleBead(): SupervisorBead {
     issue_type: 'task',
     assignee: 'mayor',
     labels: [],
+    created_at: '2026-01-01T00:00:00Z',
+  };
+}
+
+function bookkeepingBead(): SupervisorBead {
+  return {
+    id: `${PROJECT}-wisp-0003`,
+    title: 'Slack membership binding',
+    status: 'open',
+    priority: null,
+    issue_type: 'task',
+    labels: ['gc:extmsg-membership'],
     created_at: '2026-01-01T00:00:00Z',
   };
 }

@@ -1419,6 +1419,19 @@ func ensureDrainItemRoot(store beads.Store, control, unit, member beads.Bead, co
 		}
 		return "", false, fmt.Errorf("%s: instantiating drain item formula %q: %w", control.ID, itemFormula, err)
 	}
+	// Same root-latch contract as the order-dispatch twins (dispatchWisp,
+	// doOrderRunWithJSON): a freshly-minted graph.v2 root must carry the
+	// canonical dispatch hold so no demand/claim tier ever serves the latch
+	// itself to a worker as normal work -- workflow-finalize owns closing it
+	// (gc-kg0qq). isGraphV2WorkflowRecipe(recipe) is already guaranteed true
+	// here (checked above, errors out otherwise), so no extra gate is needed.
+	// This mint site (drain-item redispatch, including the failed-item
+	// replacement path via closeFailedDrainItemRoots above) never carried this
+	// stamp, unlike the other two -- confirmed as the root cause of gc-kg0qq
+	// recurring in this path (gc-gifcqt, gc-m1xjbn).
+	if err := store.Update(result.RootID, beads.UpdateOpts{Labels: []string{beadmeta.HoldExternalLabel}}); err != nil {
+		return "", false, fmt.Errorf("%s: stamping dispatch hold on drain item root %s: %w", control.ID, result.RootID, err)
+	}
 	return result.RootID, true, nil
 }
 

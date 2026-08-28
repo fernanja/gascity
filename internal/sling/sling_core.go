@@ -436,6 +436,12 @@ func slingOnFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID 
 		if hint := attachedBeadInstructionsDroppedHint(querier, beadID, opts.Vars); hint != "" {
 			result.BeadWarnings = append(result.BeadWarnings, hint)
 		}
+		if hint := liveArtifactRootCollisionHint(deps.Store, beadID, opts.Vars); hint != "" {
+			result.BeadWarnings = append(result.BeadWarnings, hint)
+		}
+		if hint := buildBasicOverwritesExistingDescriptionHint(querier, beadID, opts.OnFormula); hint != "" {
+			result.BeadWarnings = append(result.BeadWarnings, hint)
+		}
 	}
 	return result, err
 }
@@ -465,6 +471,78 @@ func attachedBeadInstructionsDroppedHint(querier BeadQuerier, beadID string, use
 		return ""
 	}
 	return fmt.Sprintf("note: bead %s's description is not carried into the formula's rendered context — pass --var context_path=<dir> or --var requirements_path=<doc> to include your instructions, or the formula's brainstorm will not see them.", beadID)
+}
+
+// liveArtifactRootCollisionHint returns a sling-time diagnostic when a
+// dispatch's --var artifact_root=<path> is already claimed by another LIVE
+// (non-closed) workflow root belonging to a DIFFERENT source bead.
+// gc.var.artifact_root is stamped on every graph.v2 root automatically
+// (molecule.stampFormulaVars), so nothing today prevents or warns when two
+// live roots share one artifact_root -- their requirements.md /
+// implementation-plan.md / review-report.md paths silently collide,
+// last-writer-wins, across unrelated bugs (gc-z0dvk9). Advisory only, same
+// shape as attachedBeadInstructionsDroppedHint: changes neither routing nor
+// the materialized wisp, and a store/list error degrades to no warning
+// rather than blocking the dispatch.
+func liveArtifactRootCollisionHint(store beads.Store, beadID string, userVars []string) string {
+	if store == nil {
+		return ""
+	}
+	var artifactRoot string
+	for _, v := range userVars {
+		key, value, ok := strings.Cut(v, "=")
+		if ok && key == "artifact_root" {
+			artifactRoot = strings.TrimSpace(value)
+		}
+	}
+	if artifactRoot == "" {
+		return ""
+	}
+	roots, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
+		Metadata: map[string]string{beadmeta.FormulaVarPrefix + "artifact_root": artifactRoot},
+	})
+	if err != nil {
+		return ""
+	}
+	var collidingIDs []string
+	for _, root := range roots {
+		if !sourceworkflow.IsWorkflowRoot(root) {
+			continue
+		}
+		if strings.TrimSpace(root.Metadata[beadmeta.SourceBeadIDMetadataKey]) == beadID {
+			continue // this bead's own prior/replacement root, not a collision
+		}
+		collidingIDs = append(collidingIDs, root.ID)
+	}
+	if len(collidingIDs) == 0 {
+		return ""
+	}
+	slices.Sort(collidingIDs)
+	return fmt.Sprintf("warning: artifact_root=%s is already in use by other LIVE workflow root(s) %s — their requirements/plan/review artifacts will silently clobber each other (last-writer-wins); give this dispatch its own unique artifact_root.", artifactRoot, strings.Join(collidingIDs, ","))
+}
+
+// buildBasicOverwritesExistingDescriptionHint returns a sling-time diagnostic
+// when formulaName is build-basic (the heaviest build-* formula, including a
+// full requirements-generation stage) and the target bead already carries a
+// non-empty description. build-basic's requirements stage brainstorms fresh
+// requirements from a blank slate; a bead that already has real
+// description/acceptance-criteria text almost always wants a lighter
+// continuation formula (e.g. build-from-plan) instead, which skips the
+// redundant stage rather than silently ignoring what was already written.
+// Doc-only guardrails for exactly this mistake (a build-formula decision
+// table plus an explicit pre-dispatch sanity-check instruction) have already
+// failed twice within 2 days in production use (gc-hpztph) -- this moves the
+// guardrail from a doc the dispatching agent must remember into the tool
+// itself. Advisory only, same shape as attachedBeadInstructionsDroppedHint.
+func buildBasicOverwritesExistingDescriptionHint(querier BeadQuerier, beadID, formulaName string) string {
+	if querier == nil || beadID == "" || formulaName != "build-basic" {
+		return ""
+	}
+	bead, err := querier.Get(beadID)
+	if err != nil || strings.TrimSpace(bead.Description) == "" {
+		return ""
+	}
+	return fmt.Sprintf("warning: bead %s already has a description, but formula=build-basic includes a full requirements-generation stage that will brainstorm fresh requirements instead of using it — if this bead's description/acceptance criteria are already what should be implemented, a lighter continuation formula (e.g. build-from-plan) likely fits better.", beadID)
 }
 
 // autoCarryBeadDescriptionVar makes the target bead's own Description
@@ -501,9 +579,16 @@ func autoCarryBeadDescriptionVar(vars map[string]string, querier BeadQuerier, be
 
 // slingDefaultFormula handles the default formula attachment path.
 func slingDefaultFormula(opts SlingOpts, deps SlingDeps, querier BeadQuerier, beadID string, result SlingResult) (SlingResult, error) {
-	result, err := attachFormulaToBead(opts, deps, querier, beadID, opts.Target.EffectiveDefaultSlingFormula(), "default-on-formula", "default formula", result)
+	defaultFormula := opts.Target.EffectiveDefaultSlingFormula()
+	result, err := attachFormulaToBead(opts, deps, querier, beadID, defaultFormula, "default-on-formula", "default formula", result)
 	if err == nil {
 		if hint := attachedBeadInstructionsDroppedHint(querier, beadID, opts.Vars); hint != "" {
+			result.BeadWarnings = append(result.BeadWarnings, hint)
+		}
+		if hint := liveArtifactRootCollisionHint(deps.Store, beadID, opts.Vars); hint != "" {
+			result.BeadWarnings = append(result.BeadWarnings, hint)
+		}
+		if hint := buildBasicOverwritesExistingDescriptionHint(querier, beadID, defaultFormula); hint != "" {
 			result.BeadWarnings = append(result.BeadWarnings, hint)
 		}
 	}

@@ -373,6 +373,74 @@ func TestDoHookClaimReturnsExistingAssignment(t *testing.T) {
 	}
 }
 
+// TestIsWorkflowTopologyHookCandidateIdentifiesLatchKinds covers gc-0mf66f:
+// a bare unit test of the predicate itself, independent of any claim tier.
+func TestIsWorkflowTopologyHookCandidateIdentifiesLatchKinds(t *testing.T) {
+	candidates := []beads.Bead{
+		{ID: "normal-task"},
+		{ID: "workflow-root", Metadata: map[string]string{"gc.kind": "workflow"}},
+		{ID: "scope-latch", Metadata: map[string]string{"gc.kind": "scope"}},
+		{ID: "formula-spec", Metadata: map[string]string{"gc.kind": "spec"}},
+		{ID: "control-check", Metadata: map[string]string{"gc.kind": "check"}},
+	}
+	var gotIDs []string
+	for _, c := range candidates {
+		if !isWorkflowTopologyHookCandidate(c) {
+			gotIDs = append(gotIDs, c.ID)
+		}
+	}
+	want := []string{"normal-task", "control-check"}
+	if len(gotIDs) != len(want) || gotIDs[0] != want[0] || gotIDs[1] != want[1] {
+		t.Fatalf("non-topology ids = %v, want %v (workflow/scope/spec are topology latches; check is an ordinary control kind, not topology)", gotIDs, want)
+	}
+}
+
+// TestDoHookClaimNeverReturnsWorkflowRootAsExistingAssignment covers
+// gc-0mf66f: `gc hook --claim` reported action=work/reason=existing_assignment
+// for a gc.kind=workflow bead that was validly in_progress and assigned to
+// the querying session -- graph.v2 workflow roots are latches and must never
+// be served as claimable work through ANY tier, including this one (which
+// has no kind-awareness of its own -- see hookClaimExistingAssignment).
+// A second, ordinary candidate proves the fix is selective: real ready work
+// alongside the latch still gets claimed normally, not starved by the fix.
+func TestDoHookClaimNeverReturnsWorkflowRootAsExistingAssignment(t *testing.T) {
+	runner := func(string, string) (string, error) {
+		return `[` +
+			`{"id":"root-1","status":"in_progress","assignee":"worker-1","metadata":{"gc.kind":"workflow","gc.routed_to":"worker"}},` +
+			`{"id":"hw-1","status":"in_progress","assignee":"worker-1","metadata":{"gc.routed_to":"worker"}}` +
+			`]`, nil
+	}
+	ops := hookClaimOps{
+		Runner: runner,
+		Claim: func(context.Context, string, []string, string, string) (beads.Bead, bool, error) {
+			t.Fatal("claim must not run for existing assigned in-progress work")
+			return beads.Bead{}, false, nil
+		},
+		ListContinuation: func(context.Context, string, []string, string, string) ([]beads.Bead, error) {
+			return nil, nil
+		},
+	}
+	opts := hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1"},
+		RouteTargets:       []string{"worker"},
+		JSON:               true,
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim(workflow root + real work) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if result.Action != "work" || result.Reason != "existing_assignment" || result.BeadID != "hw-1" {
+		t.Fatalf("unexpected claim result: %+v, want the real work item hw-1, never the workflow root root-1", result)
+	}
+}
+
 func TestDoHookClaimPromotesReadyAssignment(t *testing.T) {
 	runner := func(string, string) (string, error) {
 		return `[{"id":"hw-ready","status":"open","assignee":"worker-alias","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}}]`, nil

@@ -968,12 +968,24 @@ func TestProcessDrainReplayClosesFailedItemRootBeforeRecreate(t *testing.T) {
 		t.Fatalf("ProcessControl(drain replay): %v", err)
 	}
 	replayed := mustDrainManifest(t, mustGetBead(t, store, drain.ID))
-	if got := replayed.Rows[0].ItemRootID; got == "" || got == failedRootID {
+	replacementRootID := replayed.Rows[0].ItemRootID
+	if got := replacementRootID; got == "" || got == failedRootID {
 		t.Fatalf("replayed item root = %q, want replacement distinct from failed %q", got, failedRootID)
 	}
 	failedRoot := mustGetBead(t, store, failedRootID)
 	if failedRoot.Status != "closed" {
 		t.Fatalf("failed root status = %q, want closed", failedRoot.Status)
+	}
+	// gc-gifcqt/gc-m1xjbn: the replacement root minted by drain-item redispatch
+	// must carry the same canonical dispatch hold as an order-dispatched
+	// graph.v2 root, so gc hook --claim never hands the latch itself to a
+	// worker as normal work (gc-kg0qq class). This mint site was the one gap
+	// that didn't carry the stamp -- see order_dispatch_graph_store_test.go's
+	// TestOrderDispatchGraphWorkflowRootCarriesDispatchHold for the sibling
+	// assertion on the other two mint sites.
+	replacementRoot := mustGetBead(t, store, replacementRootID)
+	if !containsString(replacementRoot.Labels, beadmeta.HoldExternalLabel) {
+		t.Fatalf("replacement root labels = %v, want the canonical dispatch hold %q so no worker claims the latch", replacementRoot.Labels, beadmeta.HoldExternalLabel)
 	}
 }
 

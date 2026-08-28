@@ -80,6 +80,15 @@ export function BeadsPage() {
   // four status controls reading as one group while `closed` alone widens
   // the data scope.
   const [showClosed, setShowClosed] = useState(false);
+  // Bookkeeping beads (Slack extmsg bindings/membership/transcript-state,
+  // session-tracking, nudge-queue, order-tracking, ...) are durable-by-design
+  // system plumbing, not outstanding work — they carry a gc:-prefixed label
+  // or a non-engineering issue_type and never close. listSupervisorBeads
+  // already excludes them by default (includeBookkeeping ?? false, via
+  // defaultBeadFilter) but that default was previously invisible: no control
+  // on this page could turn it off to verify/audit, or confirm it was even
+  // taking effect. Same data-scope-toggle shape as showClosed above.
+  const [showBookkeeping, setShowBookkeeping] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(selectedBeadParam);
   const [closing, setClosing] = useState<SupervisorBead | null>(null);
   const [actionInFlight, setActionInFlight] = useState<string | null>(null);
@@ -93,10 +102,11 @@ export function BeadsPage() {
   const [newAgent, setNewAgent] = useState('');
 
   const { data, loading, error, refresh } = useCachedData(
-    `beads:board:${cityCacheKey}:${rigFilter}:${showClosed ? 'all' : 'open'}`,
+    `beads:board:${cityCacheKey}:${rigFilter}:${showClosed ? 'all' : 'open'}:${showBookkeeping ? 'with-system' : 'eng-only'}`,
     () =>
       listSupervisorBeads({
         includeClosed: showClosed,
+        includeBookkeeping: showBookkeeping,
         ...(rigFilter === RIG_FILTER_ALL ? {} : { rigFilter }),
       }),
   );
@@ -434,6 +444,19 @@ export function BeadsPage() {
             onToggle={toggleStatusChip}
             legend="Status"
           />
+          <label className="inline-flex items-baseline gap-2 text-label uppercase tracking-wider text-fg-muted cursor-pointer hover:text-fg transition-colors duration-150 ease-out-quart">
+            <input
+              type="checkbox"
+              checked={showBookkeeping}
+              onChange={(e) => setShowBookkeeping(e.target.checked)}
+              // Neutral accent, not maroon: the adjacent "system beads" words
+              // already name the state (greyscale-safe), matching the
+              // "running" checkbox convention on the Agents page.
+              style={{ accentColor: 'oklch(var(--fg-muted))' }}
+              className="translate-y-[2px]"
+            />
+            <span>system beads</span>
+          </label>
           {dispatchRigOptions.length > 1 && (
             <label className="flex items-baseline gap-2 text-label">
               <span className="uppercase tracking-wider text-fg-muted">Rig</span>

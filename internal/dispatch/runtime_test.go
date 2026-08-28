@@ -9997,6 +9997,175 @@ func TestProcessControlClosesControlWhenWorkflowRootCanceled(t *testing.T) {
 	}
 }
 
+// TestProcessControlClosesControlWhenWorkflowRootPlainlyClosed covers
+// gc-1j7rs4: a workflow root closed by a plain `bd close <root>` (no
+// gc.outcome, no gc.cancel_requested -- neither of the two markers
+// rootCanceled checks for) still stops an open control bead under it from
+// spawning further work, instead of the ralph/retry/fanout/drain loop
+// continuing to fire against a dead root indefinitely. The root recorded no
+// outcome, so the control bead's own outcome defaults to fail.
+func TestProcessControlClosesControlWhenWorkflowRootPlainlyClosed(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title:    "plainly closed root",
+		Type:     "molecule",
+		Status:   "open",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+	// Close the root exactly as a bare `bd close <root>` does: no gc.outcome,
+	// no gc.cancel_requested, no metadata at all beyond the close itself.
+	if _, err := store.CloseAll([]string{root.ID}, nil); err != nil {
+		t.Fatalf("close root plainly: %v", err)
+	}
+	control, err := store.Create(beads.Bead{
+		Title:  "ralph check under plainly closed root",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.kind":           "check",
+			"gc.root_bead_id":   root.ID,
+			"gc.root_store_ref": "rig:gascity",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create control: %v", err)
+	}
+
+	var traceBuf bytes.Buffer
+	opts := ProcessOptions{
+		Tracef: func(format string, args ...any) {
+			fmt.Fprintf(&traceBuf, format, args...)
+			traceBuf.WriteByte('\n')
+		},
+	}
+
+	result, err := ProcessControl(store, control, opts)
+	if err != nil {
+		t.Fatalf("ProcessControl: %v", err)
+	}
+	if !result.Processed || result.Action != "root-closed" {
+		t.Fatalf("result = %+v, want processed root-closed", result)
+	}
+	after := mustGetBead(t, store, control.ID)
+	if after.Status != "closed" {
+		t.Fatalf("status = %q, want closed", after.Status)
+	}
+	if after.Metadata["gc.outcome"] != "fail" {
+		t.Fatalf("gc.outcome = %q, want fail (root recorded no outcome, so default applies)", after.Metadata["gc.outcome"])
+	}
+	traced := traceBuf.String()
+	if !strings.Contains(traced, "close reason=root_closed") {
+		t.Fatalf("trace missing root_closed close reason; got:\n%s", traced)
+	}
+}
+
+// TestProcessControlClosesControlPropagatingRootOutcomeWhenNotCanceled covers
+// the sibling case: a workflow root closed with its own recorded gc.outcome
+// (e.g. a duplicate-dispatch race resolving to a non-survivor root that was
+// closed with an explicit disposition) but WITHOUT the cancel markers --
+// the control bead's own outcome must reflect the root's actual recorded
+// outcome, not a hardcoded "canceled" or "fail" guess.
+func TestProcessControlClosesControlPropagatingRootOutcomeWhenNotCanceled(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title:    "duplicate-loser root",
+		Type:     "molecule",
+		Status:   "open",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+	if _, err := store.CloseAll([]string{root.ID}, map[string]string{
+		"gc.outcome":       "fail",
+		"gc.failure_class": "duplicate_dispatch_superseded",
+	}); err != nil {
+		t.Fatalf("close root with recorded outcome: %v", err)
+	}
+	control, err := store.Create(beads.Bead{
+		Title:  "retry under duplicate-loser root",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.kind":           "retry",
+			"gc.root_bead_id":   root.ID,
+			"gc.root_store_ref": "rig:gascity",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create control: %v", err)
+	}
+
+	result, err := ProcessControl(store, control, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl: %v", err)
+	}
+	if !result.Processed || result.Action != "root-closed" {
+		t.Fatalf("result = %+v, want processed root-closed", result)
+	}
+	after := mustGetBead(t, store, control.ID)
+	if after.Metadata["gc.outcome"] != "fail" {
+		t.Fatalf("gc.outcome = %q, want fail (propagated from the root's own recorded outcome)", after.Metadata["gc.outcome"])
+	}
+}
+
+// TestProcessControlLeavesControlAloneWhenRootStillOpen guards against a
+// false positive: an actively in_progress or open root (not closed, not
+// canceled) must never have its control beads swept up by the
+// closeControlUnderClosedRoot gate -- only Status=="closed" specifically
+// qualifies, not "!= open" (in_progress is a real, alive status distinct
+// from both open and closed).
+func TestProcessControlLeavesControlAloneWhenRootStillOpen(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	root, err := store.Create(beads.Bead{
+		Title:    "actively in-progress root",
+		Type:     "molecule",
+		Status:   "in_progress",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	if err != nil {
+		t.Fatalf("create root: %v", err)
+	}
+	control, err := store.Create(beads.Bead{
+		Title:  "ralph check under live root",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.kind":           "check",
+			"gc.root_bead_id":   root.ID,
+			"gc.root_store_ref": "rig:gascity",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create control: %v", err)
+	}
+
+	// Call the orphan gate directly (rather than the full ProcessControl kind
+	// switch) so this test is scoped precisely to what changed, without also
+	// depending on processRalphCheck's own fixture requirements for a real
+	// "check" bead.
+	result, handled, err := closeOrphanedControl(store, control, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("closeOrphanedControl: %v", err)
+	}
+	if handled {
+		t.Fatalf("result = %+v, handled = %v, want handled=false: an in_progress root is alive and must not be treated as orphaned", result, handled)
+	}
+	after := mustGetBead(t, store, control.ID)
+	if after.Status != "open" {
+		t.Fatalf("status = %q, want still open (root is alive, not closed)", after.Status)
+	}
+}
+
 // TestProcessWorkflowFinalize_PurgesMoleculeArtifactDir verifies that
 // when a workflow finalizes, the molecule-scoped artifact directory is
 // removed so disk does not leak and a successor run with the same root

@@ -17,6 +17,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/executionevent"
+	"github.com/gastownhall/gascity/internal/graphroute"
 )
 
 const hookClaimCommandName = "hook"
@@ -680,6 +681,24 @@ func mergeHookClaimCandidateMetadata(candidate, claimed beads.Bead) beads.Bead {
 	return claimed
 }
 
+// isWorkflowTopologyHookCandidate reports whether candidate is a
+// workflow-topology bead (root workflow, scope latch, formula spec --
+// graphroute.IsWorkflowTopologyKind). Scope note: this must NOT be applied to
+// every claim tier indiscriminately -- a workflow root with no gc.routed_to
+// but a matching gc.run_target is a legitimate, still-open, LEGACY first
+// claim (the one that expands the graph into real steps, protected by
+// TestDoHookClaimClaimsLegacyRunTargetWorkflowRoot /
+// TestDoHookClaimUsesSelectedStoreContextForMutationAndContinuation) and must
+// stay claimable through claimFirstReadyHookAssignment /
+// claimFirstEligibleHookCandidate. It is only ever wrong for
+// hookClaimExistingAssignment specifically: an ALREADY in_progress+assigned
+// topology bead being handed back out again is never a legitimate re-claim
+// (gc-0mf66f) -- the graph either already expanded (nothing left to gain by
+// re-serving the root) or never will via this path.
+func isWorkflowTopologyHookCandidate(candidate beads.Bead) bool {
+	return graphroute.IsWorkflowTopologyKind(strings.TrimSpace(candidate.Metadata[beadmeta.KindMetadataKey]))
+}
+
 // hookCandidateClaimable reports whether a work-query candidate is eligible for a
 // fresh claim: it has an id, is currently unassigned, and matches one of this
 // session's route targets.
@@ -703,6 +722,17 @@ func reportHookClaimRejected(candidate, claimed beads.Bead, opts hookClaimOption
 func hookClaimExistingAssignment(candidates []beads.Bead, opts hookClaimOptions) (hookClaimJSONResult, beads.Bead, bool) {
 	for _, candidate := range candidates {
 		if hookClaimCandidateIsMessage(candidate) {
+			continue
+		}
+		if isWorkflowTopologyHookCandidate(candidate) {
+			// Never re-serve an already in_progress+assigned workflow-topology
+			// bead as "existing_assignment" work -- it is a latch, not a claim
+			// unit, regardless of how it ended up in this shape (gc-0mf66f).
+			// Deliberately narrower than filtering it out of the shared
+			// candidate slice entirely: a NOT-yet-in_progress topology bead
+			// with a matching gc.run_target is a legitimate legacy first claim
+			// and must still reach the claimFirstReadyHookAssignment /
+			// claimFirstEligibleHookCandidate tiers below.
 			continue
 		}
 		if strings.EqualFold(strings.TrimSpace(candidate.Status), "in_progress") &&

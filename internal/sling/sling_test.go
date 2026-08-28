@@ -2502,6 +2502,194 @@ func TestSlingAttachFormulaNoWarningWhenBeadHasNoDescription(t *testing.T) {
 	}
 }
 
+// TestSlingAttachFormulaWarnsOnLiveArtifactRootCollision covers gc-z0dvk9:
+// dispatching a formula with --var artifact_root=<path> that's already
+// claimed by another LIVE workflow root (a different source bead) must warn,
+// since both roots will silently clobber each other's requirements/plan/
+// review artifacts at that path.
+func TestSlingAttachFormulaWarnsOnLiveArtifactRootCollision(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	otherSource, _ := deps.Store.Create(beads.Bead{Title: "other bug", Type: "task"})
+	if _, err := deps.Store.Create(beads.Bead{
+		Title:  "existing live root",
+		Type:   "task",
+		Status: "in_progress",
+		Metadata: map[string]string{
+			"gc.kind":           "workflow",
+			"gc.source_bead_id": otherSource.ID,
+			"gc.var.artifact_root": "/tmp/shared-plans",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task"})
+
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	result, err := s.AttachFormula(context.Background(), "code-review", b.ID, a, FormulaOpts{Vars: []string{"artifact_root=/tmp/shared-plans"}})
+	if err != nil {
+		t.Fatalf("AttachFormula: %v", err)
+	}
+	found := false
+	for _, w := range result.BeadWarnings {
+		if strings.Contains(w, "already in use by other LIVE workflow root") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("BeadWarnings = %#v, want a collision hint for the shared artifact_root", result.BeadWarnings)
+	}
+}
+
+// TestSlingAttachFormulaNoWarningWhenArtifactRootUnique guards against
+// noise: a unique artifact_root with no other live root using it must not
+// warn.
+func TestSlingAttachFormulaNoWarningWhenArtifactRootUnique(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task"})
+
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	result, err := s.AttachFormula(context.Background(), "code-review", b.ID, a, FormulaOpts{Vars: []string{"artifact_root=/tmp/only-mine"}})
+	if err != nil {
+		t.Fatalf("AttachFormula: %v", err)
+	}
+	for _, w := range result.BeadWarnings {
+		if strings.Contains(w, "already in use by other LIVE workflow root") {
+			t.Errorf("BeadWarnings = %#v, want no collision hint for a unique artifact_root", result.BeadWarnings)
+		}
+	}
+}
+
+// TestSlingAttachFormulaNoWarningWhenArtifactRootCollidesOnlyWithOwnRoot
+// guards the same-source-bead exclusion: a prior/replacement root for THIS
+// SAME bead sharing the artifact_root is expected (a re-dispatch onto the
+// same bead), not a collision between unrelated work.
+func TestSlingAttachFormulaNoWarningWhenArtifactRootCollidesOnlyWithOwnRoot(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task"})
+	if _, err := deps.Store.Create(beads.Bead{
+		Title:  "this bead's own prior root",
+		Type:   "task",
+		Status: "in_progress",
+		Metadata: map[string]string{
+			"gc.kind":               "workflow",
+			"gc.source_bead_id":     b.ID,
+			"gc.var.artifact_root": "/tmp/own-path",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	result, err := s.AttachFormula(context.Background(), "code-review", b.ID, a, FormulaOpts{Vars: []string{"artifact_root=/tmp/own-path"}})
+	if err != nil {
+		t.Fatalf("AttachFormula: %v", err)
+	}
+	for _, w := range result.BeadWarnings {
+		if strings.Contains(w, "already in use by other LIVE workflow root") {
+			t.Errorf("BeadWarnings = %#v, want no collision hint when the only match is this same bead's own root", result.BeadWarnings)
+		}
+	}
+}
+
+// TestSlingAttachFormulaWarnsWhenBuildBasicOverwritesDescription covers
+// gc-4mf7ze: dispatching formula=build-basic (which brainstorms fresh
+// requirements from scratch) against a bead that already has a description
+// must warn, since a lighter continuation formula likely fits better.
+func TestSlingAttachFormulaWarnsWhenBuildBasicOverwritesDescription(t *testing.T) {
+	formulaDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(formulaDir, "build-basic.toml"), []byte(`
+formula = "build-basic"
+version = 1
+
+[[steps]]
+id = "work"
+title = "Work"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test"},
+		FormulaLayers: config.FormulaLayers{City: []string{formulaDir}},
+	}
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task", Description: "the bug is X, fix by doing Y"})
+
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	result, err := s.AttachFormula(context.Background(), "build-basic", b.ID, a, FormulaOpts{})
+	if err != nil {
+		t.Fatalf("AttachFormula: %v", err)
+	}
+	found := false
+	for _, w := range result.BeadWarnings {
+		if strings.Contains(w, "includes a full requirements-generation stage") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("BeadWarnings = %#v, want a build-basic/description-overwrite hint", result.BeadWarnings)
+	}
+}
+
+// TestSlingAttachFormulaNoWarningWhenBuildBasicBeadHasNoDescription guards
+// against noise: a description-less bead has nothing for build-basic to
+// overwrite, so no hint should fire.
+func TestSlingAttachFormulaNoWarningWhenBuildBasicBeadHasNoDescription(t *testing.T) {
+	formulaDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(formulaDir, "build-basic.toml"), []byte(`
+formula = "build-basic"
+version = 1
+
+[[steps]]
+id = "work"
+title = "Work"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test"},
+		FormulaLayers: config.FormulaLayers{City: []string{formulaDir}},
+	}
+	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
+	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task"})
+
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	result, err := s.AttachFormula(context.Background(), "build-basic", b.ID, a, FormulaOpts{})
+	if err != nil {
+		t.Fatalf("AttachFormula: %v", err)
+	}
+	for _, w := range result.BeadWarnings {
+		if strings.Contains(w, "includes a full requirements-generation stage") {
+			t.Errorf("BeadWarnings = %#v, want no hint for a description-less bead", result.BeadWarnings)
+		}
+	}
+}
+
 // TestSlingAttachFormulaAutoCarriesBeadDescriptionAsDescVar guards the
 // #3681 fix: a formula that declares a "desc" var receives the attached
 // bead's own Description as {{desc}}, landing in the wisp root's

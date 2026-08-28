@@ -198,6 +198,12 @@ func ProcessControl(store beads.Store, bead beads.Bead, opts ProcessOptions) (Co
 // teardown or a missing-root orphan close.
 const controlRootCanceledCloseReason = "control closed: workflow root canceled via run cancel"
 
+// controlRootClosedCloseReason is stamped on a control bead closed because its
+// workflow root already closed by some means other than the explicit
+// run-cancel signal -- a plain `bd close <root>`, or a duplicate-dispatch race
+// resolving to a non-survivor root, for example.
+const controlRootClosedCloseReason = "control closed: workflow root already closed"
+
 func closeOrphanedControl(store beads.Store, bead beads.Bead, opts ProcessOptions) (ControlResult, bool, error) {
 	if bead.Metadata[beadmeta.KindMetadataKey] == beadmeta.KindWorkflowFinalize {
 		return ControlResult{}, false, nil
@@ -218,6 +224,23 @@ func closeOrphanedControl(store beads.Store, bead beads.Bead, opts ProcessOption
 		// teeth.
 		if rootCanceled(root) {
 			return closeCanceledControl(store, bead, opts, rootID, rootStoreRef)
+		}
+		// Root closed by some means OTHER than the explicit cancel signal --
+		// most commonly a plain `bd close <root>` (no gc.outcome/cancel_requested
+		// stamped at all) or a duplicate-dispatch race resolving to a
+		// non-survivor root. A normally-completing workflow closes its root via
+		// processWorkflowFinalize, which cascade-closes its own open descendant
+		// control beads in the same operation, so this control bead would
+		// already be non-open (and skipped above, before reaching here) in that
+		// case -- reaching this branch means the root closed WITHOUT that
+		// cascade ever running. Without this gate, a bounded repair loop
+		// (ralph) or other control-kind bead never itself checks root
+		// liveness and keeps spawning fresh attempts/work against the dead
+		// root indefinitely (gc-1j7rs4). Confirmed: this reproduces whenever a
+		// root dies while its control loop still has attempts remaining,
+		// regardless of why the root died.
+		if root.Status == "closed" {
+			return closeControlUnderClosedRoot(store, bead, opts, rootID, rootStoreRef, root)
 		}
 		return ControlResult{}, false, nil
 	} else if !errors.Is(err, beads.ErrNotFound) {
@@ -267,6 +290,32 @@ func closeCanceledControl(store beads.Store, bead beads.Bead, opts ProcessOption
 		return ControlResult{}, true, fmt.Errorf("%s: closing canceled control: %w", bead.ID, err)
 	}
 	return ControlResult{Processed: true, Action: "canceled-workflow"}, true, nil
+}
+
+// closeControlUnderClosedRoot closes a control bead whose workflow root has
+// already closed by some means other than the explicit run-cancel signal
+// (rootCanceled) -- most commonly a plain `bd close <root>`, or a
+// duplicate-dispatch race resolving to a non-survivor root. Propagates the
+// root's own recorded gc.outcome so this control bead's terminal state
+// reflects the root's actual disposition rather than a hardcoded guess;
+// defaults to fail when the root recorded no outcome at all (the common case
+// for a bare `bd close` with no metadata).
+func closeControlUnderClosedRoot(store beads.Store, bead beads.Bead, opts ProcessOptions, rootID, rootStoreRef string, root beads.Bead) (ControlResult, bool, error) {
+	outcome := strings.TrimSpace(root.Metadata[beadmeta.OutcomeMetadataKey])
+	if outcome == "" {
+		outcome = beadmeta.OutcomeFail
+	}
+	opts.tracef("process-control bead=%s kind=%s close reason=root_closed root=%s store_ref=%s root_outcome=%s",
+		bead.ID, bead.Metadata[beadmeta.KindMetadataKey], rootID, rootStoreRef, outcome)
+	closeMetadata := map[string]string{
+		beadmeta.OutcomeMetadataKey: outcome,
+		"close_reason":              controlRootClosedCloseReason,
+	}
+	clearControllerSpawnErrorMetadata(closeMetadata)
+	if err := updateMetadataAndClose(store, bead.ID, closeMetadata); err != nil {
+		return ControlResult{}, true, fmt.Errorf("%s: closing control under closed root: %w", bead.ID, err)
+	}
+	return ControlResult{Processed: true, Action: "root-closed"}, true, nil
 }
 
 func (opts ProcessOptions) tracef(format string, args ...any) {
