@@ -37,6 +37,11 @@
         "type": "string",
         "format": "date-time"
       },
+      "closed_at": {
+        "type": "string",
+        "format": "date-time",
+        "description": "Close timestamp bd records on closed beads. Absent on open rows (every ready row) and on rows read through a backend that predates the field."
+      },
       "assignee": {
         "type": "string"
       },

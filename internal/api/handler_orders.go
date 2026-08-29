@@ -39,6 +39,8 @@ type orderResponse struct {
 	Rig            string            `json:"rig,omitempty"`
 	CaptureOutput  bool              `json:"capture_output"`
 	Env            map[string]string `json:"env,omitempty"`
+	Source         string            `json:"source,omitempty"`
+	FormulaLayer   string            `json:"formula_layer,omitempty"`
 }
 
 func resolveOrder(aa []orders.Order, name string) (*orders.Order, error) {
@@ -95,6 +97,8 @@ func toOrderResponse(a orders.Order) orderResponse {
 		Rig:           a.Rig,
 		CaptureOutput: a.IsExec(), // exec orders capture output
 		Env:           a.Env,
+		Source:        a.Source,
+		FormulaLayer:  a.FormulaLayer,
 	}
 	// check_timeout bounds only a condition trigger's check command, so surface
 	// its effective millisecond deadline only for condition orders. Other

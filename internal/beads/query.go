@@ -124,6 +124,12 @@ type ListQuery struct {
 	// Legacy beads with zero UpdatedAt fall back to CreatedAt. Purge callers
 	// using CachingStore must also set Live: true to avoid stale cached timestamps.
 	UpdatedBefore time.Time
+	// ClosedAfter matches closed beads whose close time is at or after this
+	// timestamp; open beads never match (mirroring bd's --closed-after, where
+	// a NULL closed_at excludes the row). Beads read through a backend that
+	// predates ClosedAt fall back to UpdatedAt as the close-time reference.
+	// Callers typically pair it with Status: "closed" or IncludeClosed.
+	ClosedAfter time.Time
 	Limit         int
 	IncludeClosed bool
 	AllowScan     bool
@@ -224,6 +230,7 @@ func (q ListQuery) HasFilter() bool {
 		len(q.Metadata) > 0 ||
 		!q.CreatedBefore.IsZero() ||
 		!q.UpdatedBefore.IsZero() ||
+		!q.ClosedAfter.IsZero() ||
 		q.SeekAfter != nil
 }
 
@@ -303,6 +310,14 @@ func (q ListQuery) Matches(b Bead) bool {
 	if !q.UpdatedBefore.IsZero() && !beadUpdatedReferenceTime(b).Before(q.UpdatedBefore) {
 		return false
 	}
+	if !q.ClosedAfter.IsZero() {
+		if b.Status != "closed" {
+			return false
+		}
+		if beadClosedReferenceTime(b).Before(q.ClosedAfter) {
+			return false
+		}
+	}
 	if q.SeekAfter != nil && !q.SeekAfter.After(b, q.Sort) {
 		return false
 	}
@@ -337,6 +352,16 @@ func beadUpdatedReferenceTime(b Bead) time.Time {
 		return b.UpdatedAt
 	}
 	return b.CreatedAt
+}
+
+// beadClosedReferenceTime is the close-time reference for ClosedAfter: the
+// recorded ClosedAt when the backend provided one, otherwise UpdatedAt (a
+// close always bumps updated_at), otherwise CreatedAt.
+func beadClosedReferenceTime(b Bead) time.Time {
+	if b.ClosedAt != nil && !b.ClosedAt.IsZero() {
+		return *b.ClosedAt
+	}
+	return beadUpdatedReferenceTime(b)
 }
 
 func beadHasLabel(b Bead, want string) bool {

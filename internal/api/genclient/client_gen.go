@@ -117,6 +117,30 @@ func (e EventRotateArchiveCompressionStatus) Valid() bool {
 	}
 }
 
+// Defines values for OrderFileEntryRole.
+const (
+	OrderFileEntryRoleCheck   OrderFileEntryRole = "check"
+	OrderFileEntryRoleFormula OrderFileEntryRole = "formula"
+	OrderFileEntryRoleOrder   OrderFileEntryRole = "order"
+	OrderFileEntryRoleScript  OrderFileEntryRole = "script"
+)
+
+// Valid indicates whether the value is a known member of the OrderFileEntryRole enum.
+func (e OrderFileEntryRole) Valid() bool {
+	switch e {
+	case OrderFileEntryRoleCheck:
+		return true
+	case OrderFileEntryRoleFormula:
+		return true
+	case OrderFileEntryRoleOrder:
+		return true
+	case OrderFileEntryRoleScript:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for RequestFailedPayloadOperation.
 const (
 	CityCreate     RequestFailedPayloadOperation = "city.create"
@@ -170,16 +194,16 @@ func (e RigCreateResponseBodyStatus) Valid() bool {
 
 // Defines values for RunRefKind.
 const (
-	Order RunRefKind = "order"
-	Sling RunRefKind = "sling"
+	RunRefKindOrder RunRefKind = "order"
+	RunRefKindSling RunRefKind = "sling"
 )
 
 // Valid indicates whether the value is a known member of the RunRefKind enum.
 func (e RunRefKind) Valid() bool {
 	switch e {
-	case Order:
+	case RunRefKindOrder:
 		return true
-	case Sling:
+	case RunRefKindSling:
 		return true
 	default:
 		return false
@@ -1158,6 +1182,7 @@ type BackendCredentialResolvedPayload struct {
 // Bead defines model for Bead.
 type Bead struct {
 	Assignee     *string            `json:"assignee,omitempty"`
+	ClosedAt     *time.Time         `json:"closed_at,omitempty"`
 	CreatedAt    time.Time          `json:"created_at"`
 	DeferUntil   *time.Time         `json:"defer_until,omitempty"`
 	Dependencies *[]Dep             `json:"dependencies,omitempty"`
@@ -2667,6 +2692,45 @@ type OrderCheckResponse struct {
 	ScopedName     string  `json:"scoped_name"`
 }
 
+// OrderFileEntry defines model for OrderFileEntry.
+type OrderFileEntry struct {
+	// Content File content, absent when Error is set.
+	Content *string `json:"content,omitempty"`
+
+	// Error Why this entry has no content (missing, binary, outside serving roots).
+	Error *string `json:"error,omitempty"`
+
+	// Language Display language hint (toml, shell, markdown, text).
+	Language string `json:"language"`
+
+	// Path Resolved absolute path.
+	Path string `json:"path"`
+
+	// Ref The reference as written in the order definition (may contain $ORDER_DIR/$PACK_DIR).
+	Ref string `json:"ref"`
+
+	// Role What this file is to the order.
+	Role OrderFileEntryRole `json:"role"`
+
+	// SizeBytes File size in bytes; 0 when the file could not be read.
+	SizeBytes int64 `json:"size_bytes"`
+
+	// Truncated True when Content was clipped at the size cap.
+	Truncated *bool `json:"truncated,omitempty"`
+}
+
+// OrderFileEntryRole What this file is to the order.
+type OrderFileEntryRole string
+
+// OrderFilesBody defines model for OrderFilesBody.
+type OrderFilesBody struct {
+	// Files The order definition and every file it references, order TOML first.
+	Files *[]OrderFileEntry `json:"files"`
+
+	// ScopedName Scoped order name.
+	ScopedName string `json:"scoped_name"`
+}
+
 // OrderHistoryDetailResponse defines model for OrderHistoryDetailResponse.
 type OrderHistoryDetailResponse struct {
 	BeadId    string    `json:"bead_id"`
@@ -2717,6 +2781,7 @@ type OrderResponse struct {
 	Env            *map[string]string `json:"env,omitempty"`
 	Exec           *string            `json:"exec,omitempty"`
 	Formula        *string            `json:"formula,omitempty"`
+	FormulaLayer   *string            `json:"formula_layer,omitempty"`
 	// Deprecated: this property has been marked as deprecated upstream, but no `x-deprecated-reason` was set
 	Gate       *string `json:"gate,omitempty"`
 	Interval   *string `json:"interval,omitempty"`
@@ -2726,6 +2791,7 @@ type OrderResponse struct {
 	Rig        *string `json:"rig,omitempty"`
 	Schedule   *string `json:"schedule,omitempty"`
 	ScopedName string  `json:"scoped_name"`
+	Source     *string `json:"source,omitempty"`
 	Timeout    *string `json:"timeout,omitempty"`
 	TimeoutMs  int64   `json:"timeout_ms"`
 	Trigger    *string `json:"trigger,omitempty"`
@@ -8411,6 +8477,121 @@ type UsageTotals struct {
 	WallSeconds float64 `json:"wall_seconds"`
 }
 
+// VelocityBeads defines model for VelocityBeads.
+type VelocityBeads struct {
+	// ByKind Completions grouped by gc.kind; beads with no kind report as '(work)'.
+	ByKind *[]VelocityGroupCount `json:"by_kind,omitempty"`
+
+	// ByType Completions grouped by issue type.
+	ByType *[]VelocityGroupCount `json:"by_type,omitempty"`
+
+	// Closed Beads closed in the window across all stores (sessions and wisps excluded).
+	Closed int64 `json:"closed"`
+
+	// Partial True when at least one bead store could not be read.
+	Partial *bool `json:"partial,omitempty"`
+
+	// PartialReasons Stores or reads that were skipped.
+	PartialReasons *[]string `json:"partial_reasons,omitempty"`
+
+	// WispsClosed Wisp-tier (ephemeral/no-history) closures in the window, reported separately from Closed.
+	WispsClosed int64 `json:"wisps_closed"`
+}
+
+// VelocityBody defines model for VelocityBody.
+type VelocityBody struct {
+	Beads VelocityBeads `json:"beads"`
+
+	// GeneratedAt RFC3339 time the aggregate was built.
+	GeneratedAt string       `json:"generated_at"`
+	Prs         VelocityPRs  `json:"prs"`
+	Runs        VelocityRuns `json:"runs"`
+
+	// Since RFC3339 start of the window (server clock).
+	Since string `json:"since"`
+
+	// WindowHours Aggregation window in hours.
+	WindowHours int64 `json:"window_hours"`
+}
+
+// VelocityFormulaRuns defines model for VelocityFormulaRuns.
+type VelocityFormulaRuns struct {
+	// Completed Workflow roots closed in the window.
+	Completed int64 `json:"completed"`
+
+	// Failed Runs whose gc.outcome is fail.
+	Failed int64 `json:"failed"`
+
+	// Formula Formula name.
+	Formula string `json:"formula"`
+
+	// Passed Runs whose gc.outcome is pass.
+	Passed int64 `json:"passed"`
+
+	// Skipped Runs whose gc.outcome is skipped.
+	Skipped int64 `json:"skipped"`
+}
+
+// VelocityGroupCount defines model for VelocityGroupCount.
+type VelocityGroupCount struct {
+	// Closed Beads closed in the window for this group.
+	Closed int64 `json:"closed"`
+
+	// Group Group key (formula name, issue type, or gc.kind).
+	Group string `json:"group"`
+}
+
+// VelocityPRRepo defines model for VelocityPRRepo.
+type VelocityPRRepo struct {
+	// Created Pull requests created in the window.
+	Created int64 `json:"created"`
+
+	// Merged Pull requests merged in the window.
+	Merged int64 `json:"merged"`
+
+	// Repo owner/repo slug.
+	Repo string `json:"repo"`
+}
+
+// VelocityPRs defines model for VelocityPRs.
+type VelocityPRs struct {
+	// Available True when PR counts were resolved from GitHub (possibly from a recent cache).
+	Available bool `json:"available"`
+
+	// Created Pull requests created across all configured repositories in the window.
+	Created int64 `json:"created"`
+
+	// FetchedAt RFC3339 time the GitHub counts were fetched.
+	FetchedAt *string `json:"fetched_at,omitempty"`
+
+	// Merged Pull requests merged across all configured repositories in the window.
+	Merged int64 `json:"merged"`
+
+	// Repos Per-repository breakdown.
+	Repos *[]VelocityPRRepo `json:"repos,omitempty"`
+
+	// Stale True when a refresh failed and these counts are a retained last-good reading.
+	Stale *bool `json:"stale,omitempty"`
+
+	// UnavailableReason Why PR counts are unavailable, when Available is false.
+	UnavailableReason *string `json:"unavailable_reason,omitempty"`
+}
+
+// VelocityRuns defines model for VelocityRuns.
+type VelocityRuns struct {
+	// ByFormula Per-formula breakdown, largest first, capped with an 'other' rollup.
+	ByFormula *[]VelocityFormulaRuns `json:"by_formula,omitempty"`
+
+	// Completed Workflow roots closed in the window across all stores.
+	Completed int64 `json:"completed"`
+
+	// Partial True when at least one bead store could not be read.
+	Partial *bool `json:"partial,omitempty"`
+
+	// PartialReasons Stores or reads that were skipped.
+	PartialReasons *[]string `json:"partial_reasons,omitempty"`
+}
+
 // WaitListBody defines model for WaitListBody.
 type WaitListBody struct {
 	// Capped True when the lookup hit the per-scope cap and the list is partial.
@@ -9323,6 +9504,12 @@ type PostV0CityByCityNameOrderByNameRunParams struct {
 	XGCRequest string `json:"X-GC-Request"`
 }
 
+// GetV0CityByCityNameOrdersParams defines parameters for GetV0CityByCityNameOrders.
+type GetV0CityByCityNameOrdersParams struct {
+	// All Include disabled orders. Default lists only the active set.
+	All *bool `form:"all,omitempty" json:"all,omitempty"`
+}
+
 // GetV0CityByCityNameOrdersCheckParams defines parameters for GetV0CityByCityNameOrdersCheck.
 type GetV0CityByCityNameOrdersCheckParams struct {
 	// Fresh Bypass cached order-check responses and cached order history.
@@ -9684,6 +9871,12 @@ type PostV0CityByCityNameUnregisterParams struct {
 type GetV0CityByCityNameUsageParams struct {
 	// AggregateOnly Omit the per-session breakdown and return city-level totals only.
 	AggregateOnly *bool `form:"aggregate_only,omitempty" json:"aggregate_only,omitempty"`
+}
+
+// GetV0CityByCityNameVelocityParams defines parameters for GetV0CityByCityNameVelocity.
+type GetV0CityByCityNameVelocityParams struct {
+	// WindowHours Aggregation window in hours. Defaults to 72.
+	WindowHours *int64 `form:"window_hours,omitempty" json:"window_hours,omitempty"`
 }
 
 // GetV0CityByCityNameWaitsParams defines parameters for GetV0CityByCityNameWaits.
@@ -18864,7 +19057,7 @@ type ClientInterface interface {
 	PostV0CityByCityNameOrderByNameRun(ctx context.Context, cityName string, name string, params *PostV0CityByCityNameOrderByNameRunParams, body PostV0CityByCityNameOrderByNameRunJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GetV0CityByCityNameOrders request
-	GetV0CityByCityNameOrders(ctx context.Context, cityName string, reqEditors ...RequestEditorFn) (*http.Response, error)
+	GetV0CityByCityNameOrders(ctx context.Context, cityName string, params *GetV0CityByCityNameOrdersParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GetV0CityByCityNameOrdersCheck request
 	GetV0CityByCityNameOrdersCheck(ctx context.Context, cityName string, params *GetV0CityByCityNameOrdersCheckParams, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -18874,6 +19067,9 @@ type ClientInterface interface {
 
 	// GetV0CityByCityNameOrdersHistory request
 	GetV0CityByCityNameOrdersHistory(ctx context.Context, cityName string, params *GetV0CityByCityNameOrdersHistoryParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetV0CityByCityNameOrdersByNameFiles request
+	GetV0CityByCityNameOrdersByNameFiles(ctx context.Context, cityName string, name string, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GetV0CityByCityNamePacks request
 	GetV0CityByCityNamePacks(ctx context.Context, cityName string, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -19095,6 +19291,9 @@ type ClientInterface interface {
 
 	// GetV0CityByCityNameUsage request
 	GetV0CityByCityNameUsage(ctx context.Context, cityName string, params *GetV0CityByCityNameUsageParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetV0CityByCityNameVelocity request
+	GetV0CityByCityNameVelocity(ctx context.Context, cityName string, params *GetV0CityByCityNameVelocityParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// GetV0CityByCityNameWaitById request
 	GetV0CityByCityNameWaitById(ctx context.Context, cityName string, id string, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -20513,8 +20712,8 @@ func (c *Client) PostV0CityByCityNameOrderByNameRun(ctx context.Context, cityNam
 	return c.Client.Do(req)
 }
 
-func (c *Client) GetV0CityByCityNameOrders(ctx context.Context, cityName string, reqEditors ...RequestEditorFn) (*http.Response, error) {
-	req, err := NewGetV0CityByCityNameOrdersRequest(c.Server, cityName)
+func (c *Client) GetV0CityByCityNameOrders(ctx context.Context, cityName string, params *GetV0CityByCityNameOrdersParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetV0CityByCityNameOrdersRequest(c.Server, cityName, params)
 	if err != nil {
 		return nil, err
 	}
@@ -20551,6 +20750,18 @@ func (c *Client) GetV0CityByCityNameOrdersFeed(ctx context.Context, cityName str
 
 func (c *Client) GetV0CityByCityNameOrdersHistory(ctx context.Context, cityName string, params *GetV0CityByCityNameOrdersHistoryParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewGetV0CityByCityNameOrdersHistoryRequest(c.Server, cityName, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) GetV0CityByCityNameOrdersByNameFiles(ctx context.Context, cityName string, name string, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetV0CityByCityNameOrdersByNameFilesRequest(c.Server, cityName, name)
 	if err != nil {
 		return nil, err
 	}
@@ -21499,6 +21710,18 @@ func (c *Client) PostV0CityByCityNameUnregister(ctx context.Context, cityName st
 
 func (c *Client) GetV0CityByCityNameUsage(ctx context.Context, cityName string, params *GetV0CityByCityNameUsageParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewGetV0CityByCityNameUsageRequest(c.Server, cityName, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+func (c *Client) GetV0CityByCityNameVelocity(ctx context.Context, cityName string, params *GetV0CityByCityNameVelocityParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetV0CityByCityNameVelocityRequest(c.Server, cityName, params)
 	if err != nil {
 		return nil, err
 	}
@@ -27537,7 +27760,7 @@ func NewPostV0CityByCityNameOrderByNameRunRequestWithBody(server string, cityNam
 }
 
 // NewGetV0CityByCityNameOrdersRequest generates requests for GetV0CityByCityNameOrders
-func NewGetV0CityByCityNameOrdersRequest(server string, cityName string) (*http.Request, error) {
+func NewGetV0CityByCityNameOrdersRequest(server string, cityName string, params *GetV0CityByCityNameOrdersParams) (*http.Request, error) {
 	var err error
 
 	var pathParam0 string
@@ -27560,6 +27783,28 @@ func NewGetV0CityByCityNameOrdersRequest(server string, cityName string) (*http.
 	queryURL, err := serverURL.Parse(operationPath)
 	if err != nil {
 		return nil, err
+	}
+
+	if params != nil {
+		queryValues := queryURL.Query()
+
+		if params.All != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "all", *params.All, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "boolean", Format: ""}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
+		queryURL.RawQuery = queryValues.Encode()
 	}
 
 	req, err := http.NewRequest("GET", queryURL.String(), nil)
@@ -27788,6 +28033,47 @@ func NewGetV0CityByCityNameOrdersHistoryRequest(server string, cityName string, 
 		}
 
 		queryURL.RawQuery = queryValues.Encode()
+	}
+
+	req, err := http.NewRequest("GET", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewGetV0CityByCityNameOrdersByNameFilesRequest generates requests for GetV0CityByCityNameOrdersByNameFiles
+func NewGetV0CityByCityNameOrdersByNameFilesRequest(server string, cityName string, name string) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cityName", cityName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "name", name, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v0/city/%s/orders/%s/files", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
 	}
 
 	req, err := http.NewRequest("GET", queryURL.String(), nil)
@@ -31442,6 +31728,62 @@ func NewGetV0CityByCityNameUsageRequest(server string, cityName string, params *
 	return req, nil
 }
 
+// NewGetV0CityByCityNameVelocityRequest generates requests for GetV0CityByCityNameVelocity
+func NewGetV0CityByCityNameVelocityRequest(server string, cityName string, params *GetV0CityByCityNameVelocityParams) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "cityName", cityName, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v0/city/%s/velocity", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		queryValues := queryURL.Query()
+
+		if params.WindowHours != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", false, "window_hours", *params.WindowHours, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: "int64"}); err != nil {
+				return nil, err
+			} else if parsed, err := url.ParseQuery(queryFrag); err != nil {
+				return nil, err
+			} else {
+				for k, v := range parsed {
+					for _, v2 := range v {
+						queryValues.Add(k, v2)
+					}
+				}
+			}
+
+		}
+
+		queryURL.RawQuery = queryValues.Encode()
+	}
+
+	req, err := http.NewRequest("GET", queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
 // NewGetV0CityByCityNameWaitByIdRequest generates requests for GetV0CityByCityNameWaitById
 func NewGetV0CityByCityNameWaitByIdRequest(server string, cityName string, id string) (*http.Request, error) {
 	var err error
@@ -32398,7 +32740,7 @@ type ClientWithResponsesInterface interface {
 	PostV0CityByCityNameOrderByNameRunWithResponse(ctx context.Context, cityName string, name string, params *PostV0CityByCityNameOrderByNameRunParams, body PostV0CityByCityNameOrderByNameRunJSONRequestBody, reqEditors ...RequestEditorFn) (*PostV0CityByCityNameOrderByNameRunResponse, error)
 
 	// GetV0CityByCityNameOrdersWithResponse request
-	GetV0CityByCityNameOrdersWithResponse(ctx context.Context, cityName string, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameOrdersResponse, error)
+	GetV0CityByCityNameOrdersWithResponse(ctx context.Context, cityName string, params *GetV0CityByCityNameOrdersParams, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameOrdersResponse, error)
 
 	// GetV0CityByCityNameOrdersCheckWithResponse request
 	GetV0CityByCityNameOrdersCheckWithResponse(ctx context.Context, cityName string, params *GetV0CityByCityNameOrdersCheckParams, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameOrdersCheckResponse, error)
@@ -32408,6 +32750,9 @@ type ClientWithResponsesInterface interface {
 
 	// GetV0CityByCityNameOrdersHistoryWithResponse request
 	GetV0CityByCityNameOrdersHistoryWithResponse(ctx context.Context, cityName string, params *GetV0CityByCityNameOrdersHistoryParams, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameOrdersHistoryResponse, error)
+
+	// GetV0CityByCityNameOrdersByNameFilesWithResponse request
+	GetV0CityByCityNameOrdersByNameFilesWithResponse(ctx context.Context, cityName string, name string, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameOrdersByNameFilesResponse, error)
 
 	// GetV0CityByCityNamePacksWithResponse request
 	GetV0CityByCityNamePacksWithResponse(ctx context.Context, cityName string, reqEditors ...RequestEditorFn) (*GetV0CityByCityNamePacksResponse, error)
@@ -32629,6 +32974,9 @@ type ClientWithResponsesInterface interface {
 
 	// GetV0CityByCityNameUsageWithResponse request
 	GetV0CityByCityNameUsageWithResponse(ctx context.Context, cityName string, params *GetV0CityByCityNameUsageParams, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameUsageResponse, error)
+
+	// GetV0CityByCityNameVelocityWithResponse request
+	GetV0CityByCityNameVelocityWithResponse(ctx context.Context, cityName string, params *GetV0CityByCityNameVelocityParams, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameVelocityResponse, error)
 
 	// GetV0CityByCityNameWaitByIdWithResponse request
 	GetV0CityByCityNameWaitByIdWithResponse(ctx context.Context, cityName string, id string, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameWaitByIdResponse, error)
@@ -35178,6 +35526,32 @@ func (r GetV0CityByCityNameOrdersHistoryResponse) StatusCode() int {
 	return 0
 }
 
+type GetV0CityByCityNameOrdersByNameFilesResponse struct {
+	Body                      []byte
+	HTTPResponse              *http.Response
+	JSON200                   *OrderFilesBody
+	ApplicationproblemJSON404 *ErrorModel
+	ApplicationproblemJSON409 *ErrorModel
+	ApplicationproblemJSON422 *ErrorModel
+	ApplicationproblemJSON500 *ErrorModel
+}
+
+// Status returns HTTPResponse.Status
+func (r GetV0CityByCityNameOrdersByNameFilesResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetV0CityByCityNameOrdersByNameFilesResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
 type GetV0CityByCityNamePacksResponse struct {
 	Body                      []byte
 	HTTPResponse              *http.Response
@@ -36894,6 +37268,32 @@ func (r GetV0CityByCityNameUsageResponse) StatusCode() int {
 	return 0
 }
 
+type GetV0CityByCityNameVelocityResponse struct {
+	Body                      []byte
+	HTTPResponse              *http.Response
+	JSON200                   *VelocityBody
+	ApplicationproblemJSON404 *ErrorModel
+	ApplicationproblemJSON422 *ErrorModel
+	ApplicationproblemJSON500 *ErrorModel
+	ApplicationproblemJSON503 *ErrorModel
+}
+
+// Status returns HTTPResponse.Status
+func (r GetV0CityByCityNameVelocityResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetV0CityByCityNameVelocityResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
 type GetV0CityByCityNameWaitByIdResponse struct {
 	Body                      []byte
 	HTTPResponse              *http.Response
@@ -38109,8 +38509,8 @@ func (c *ClientWithResponses) PostV0CityByCityNameOrderByNameRunWithResponse(ctx
 }
 
 // GetV0CityByCityNameOrdersWithResponse request returning *GetV0CityByCityNameOrdersResponse
-func (c *ClientWithResponses) GetV0CityByCityNameOrdersWithResponse(ctx context.Context, cityName string, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameOrdersResponse, error) {
-	rsp, err := c.GetV0CityByCityNameOrders(ctx, cityName, reqEditors...)
+func (c *ClientWithResponses) GetV0CityByCityNameOrdersWithResponse(ctx context.Context, cityName string, params *GetV0CityByCityNameOrdersParams, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameOrdersResponse, error) {
+	rsp, err := c.GetV0CityByCityNameOrders(ctx, cityName, params, reqEditors...)
 	if err != nil {
 		return nil, err
 	}
@@ -38142,6 +38542,15 @@ func (c *ClientWithResponses) GetV0CityByCityNameOrdersHistoryWithResponse(ctx c
 		return nil, err
 	}
 	return ParseGetV0CityByCityNameOrdersHistoryResponse(rsp)
+}
+
+// GetV0CityByCityNameOrdersByNameFilesWithResponse request returning *GetV0CityByCityNameOrdersByNameFilesResponse
+func (c *ClientWithResponses) GetV0CityByCityNameOrdersByNameFilesWithResponse(ctx context.Context, cityName string, name string, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameOrdersByNameFilesResponse, error) {
+	rsp, err := c.GetV0CityByCityNameOrdersByNameFiles(ctx, cityName, name, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetV0CityByCityNameOrdersByNameFilesResponse(rsp)
 }
 
 // GetV0CityByCityNamePacksWithResponse request returning *GetV0CityByCityNamePacksResponse
@@ -38837,6 +39246,15 @@ func (c *ClientWithResponses) GetV0CityByCityNameUsageWithResponse(ctx context.C
 		return nil, err
 	}
 	return ParseGetV0CityByCityNameUsageResponse(rsp)
+}
+
+// GetV0CityByCityNameVelocityWithResponse request returning *GetV0CityByCityNameVelocityResponse
+func (c *ClientWithResponses) GetV0CityByCityNameVelocityWithResponse(ctx context.Context, cityName string, params *GetV0CityByCityNameVelocityParams, reqEditors ...RequestEditorFn) (*GetV0CityByCityNameVelocityResponse, error) {
+	rsp, err := c.GetV0CityByCityNameVelocity(ctx, cityName, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetV0CityByCityNameVelocityResponse(rsp)
 }
 
 // GetV0CityByCityNameWaitByIdWithResponse request returning *GetV0CityByCityNameWaitByIdResponse
@@ -44668,6 +45086,60 @@ func ParseGetV0CityByCityNameOrdersHistoryResponse(rsp *http.Response) (*GetV0Ci
 	return response, nil
 }
 
+// ParseGetV0CityByCityNameOrdersByNameFilesResponse parses an HTTP response from a GetV0CityByCityNameOrdersByNameFilesWithResponse call
+func ParseGetV0CityByCityNameOrdersByNameFilesResponse(rsp *http.Response) (*GetV0CityByCityNameOrdersByNameFilesResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetV0CityByCityNameOrdersByNameFilesResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest OrderFilesBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON500 = &dest
+
+	}
+
+	return response, nil
+}
+
 // ParseGetV0CityByCityNamePacksResponse parses an HTTP response from a GetV0CityByCityNamePacksWithResponse call
 func ParseGetV0CityByCityNamePacksResponse(rsp *http.Response) (*GetV0CityByCityNamePacksResponse, error) {
 	bodyBytes, err := io.ReadAll(rsp.Body)
@@ -48578,6 +49050,60 @@ func ParseGetV0CityByCityNameUsageResponse(rsp *http.Response) (*GetV0CityByCity
 	switch {
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
 		var dest UsageBody
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 422:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON422 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 500:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON500 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 503:
+		var dest ErrorModel
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.ApplicationproblemJSON503 = &dest
+
+	}
+
+	return response, nil
+}
+
+// ParseGetV0CityByCityNameVelocityResponse parses an HTTP response from a GetV0CityByCityNameVelocityWithResponse call
+func ParseGetV0CityByCityNameVelocityResponse(rsp *http.Response) (*GetV0CityByCityNameVelocityResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetV0CityByCityNameVelocityResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest VelocityBody
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
 			return nil, err
 		}

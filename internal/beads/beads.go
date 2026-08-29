@@ -69,7 +69,11 @@ type Bead struct {
 	Priority  *int      `json:"priority,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	// UpdatedAt is zero for legacy beads; UpdatedBefore falls back to CreatedAt.
-	UpdatedAt   time.Time `json:"updated_at,omitempty,omitzero"`
+	UpdatedAt time.Time `json:"updated_at,omitempty,omitzero"`
+	// ClosedAt is the close timestamp bd records on closed beads. Nil for open
+	// beads and for closed beads read through a backend that predates the
+	// field; ClosedAfter falls back to UpdatedAt in that case.
+	ClosedAt    *time.Time `json:"closed_at,omitempty"`
 	Assignee    string    `json:"assignee,omitempty"`
 	From        string    `json:"from,omitempty"`
 	ParentID    string    `json:"parent,omitempty"`      // step → molecule; matches bd wire format
@@ -378,6 +382,16 @@ func cloneTimePtr(v *time.Time) *time.Time {
 	}
 	cloned := *v
 	return &cloned
+}
+
+// truncateTimePtr clones the pointer with the value truncated to second
+// precision, matching the CreatedAt/UpdatedAt handling in bdIssue.toBead.
+func truncateTimePtr(v *time.Time) *time.Time {
+	if v == nil {
+		return nil
+	}
+	truncated := v.Truncate(time.Second)
+	return &truncated
 }
 
 func cloneBoolPtr(v *bool) *bool {

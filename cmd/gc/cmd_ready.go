@@ -60,6 +60,7 @@ type readyBead struct {
 	Priority     *int              `json:"priority,omitempty"`
 	CreatedAt    time.Time         `json:"created_at"`
 	UpdatedAt    time.Time         `json:"updated_at,omitempty,omitzero"`
+	ClosedAt     *time.Time        `json:"closed_at,omitempty"`
 	Assignee     string            `json:"assignee,omitempty"`
 	From         string            `json:"from,omitempty"`
 	ParentID     string            `json:"parent,omitempty"`
@@ -128,6 +129,7 @@ func toReadyBead(b beads.Bead) readyBead {
 		Priority:     b.Priority,
 		CreatedAt:    b.CreatedAt,
 		UpdatedAt:    b.UpdatedAt,
+		ClosedAt:     b.ClosedAt,
 		Assignee:     b.Assignee,
 		From:         b.From,
 		ParentID:     b.ParentID,

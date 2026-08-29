@@ -279,6 +279,7 @@ export type BackendCredentialResolvedPayload = {
 
 export type Bead = {
     assignee?: string;
+    closed_at?: string;
     created_at: string;
     defer_until?: string;
     dependencies?: Array<Dep> | null;
@@ -2036,6 +2037,52 @@ export type OrderCheckResponse = {
     scoped_name: string;
 };
 
+export type OrderFileEntry = {
+    /**
+     * File content, absent when Error is set.
+     */
+    content?: string;
+    /**
+     * Why this entry has no content (missing, binary, outside serving roots).
+     */
+    error?: string;
+    /**
+     * Display language hint (toml, shell, markdown, text).
+     */
+    language: string;
+    /**
+     * Resolved absolute path.
+     */
+    path: string;
+    /**
+     * The reference as written in the order definition (may contain $ORDER_DIR/$PACK_DIR).
+     */
+    ref: string;
+    /**
+     * What this file is to the order.
+     */
+    role: 'order' | 'script' | 'check' | 'formula';
+    /**
+     * File size in bytes; 0 when the file could not be read.
+     */
+    size_bytes: number;
+    /**
+     * True when Content was clipped at the size cap.
+     */
+    truncated?: boolean;
+};
+
+export type OrderFilesBody = {
+    /**
+     * The order definition and every file it references, order TOML first.
+     */
+    files: Array<OrderFileEntry> | null;
+    /**
+     * Scoped order name.
+     */
+    scoped_name: string;
+};
+
 export type OrderHistoryDetailResponse = {
     bead_id: string;
     created_at: string;
@@ -2087,6 +2134,7 @@ export type OrderResponse = {
     };
     exec?: string;
     formula?: string;
+    formula_layer?: string;
     /**
      * @deprecated
      */
@@ -2098,6 +2146,7 @@ export type OrderResponse = {
     rig?: string;
     schedule?: string;
     scoped_name: string;
+    source?: string;
     timeout?: string;
     timeout_ms: number;
     trigger?: string;
@@ -9078,6 +9127,159 @@ export type UsageTotals = {
     wall_seconds: number;
 };
 
+export type VelocityBeads = {
+    /**
+     * Completions grouped by gc.kind; beads with no kind report as '(work)'.
+     */
+    by_kind?: Array<VelocityGroupCount> | null;
+    /**
+     * Completions grouped by issue type.
+     */
+    by_type?: Array<VelocityGroupCount> | null;
+    /**
+     * Beads closed in the window across all stores (sessions and wisps excluded).
+     */
+    closed: number;
+    /**
+     * True when at least one bead store could not be read.
+     */
+    partial?: boolean;
+    /**
+     * Stores or reads that were skipped.
+     */
+    partial_reasons?: Array<string> | null;
+    /**
+     * Wisp-tier (ephemeral/no-history) closures in the window, reported separately from Closed.
+     */
+    wisps_closed: number;
+};
+
+export type VelocityBody = {
+    /**
+     * Bead completions.
+     */
+    beads: VelocityBeads;
+    /**
+     * RFC3339 time the aggregate was built.
+     */
+    generated_at: string;
+    /**
+     * GitHub pull-request counts.
+     */
+    prs: VelocityPrs;
+    /**
+     * Completed formula runs.
+     */
+    runs: VelocityRuns;
+    /**
+     * RFC3339 start of the window (server clock).
+     */
+    since: string;
+    /**
+     * Aggregation window in hours.
+     */
+    window_hours: number;
+};
+
+export type VelocityFormulaRuns = {
+    /**
+     * Workflow roots closed in the window.
+     */
+    completed: number;
+    /**
+     * Runs whose gc.outcome is fail.
+     */
+    failed: number;
+    /**
+     * Formula name.
+     */
+    formula: string;
+    /**
+     * Runs whose gc.outcome is pass.
+     */
+    passed: number;
+    /**
+     * Runs whose gc.outcome is skipped.
+     */
+    skipped: number;
+};
+
+export type VelocityGroupCount = {
+    /**
+     * Beads closed in the window for this group.
+     */
+    closed: number;
+    /**
+     * Group key (formula name, issue type, or gc.kind).
+     */
+    group: string;
+};
+
+export type VelocityPrRepo = {
+    /**
+     * Pull requests created in the window.
+     */
+    created: number;
+    /**
+     * Pull requests merged in the window.
+     */
+    merged: number;
+    /**
+     * owner/repo slug.
+     */
+    repo: string;
+};
+
+export type VelocityPrs = {
+    /**
+     * True when PR counts were resolved from GitHub (possibly from a recent cache).
+     */
+    available: boolean;
+    /**
+     * Pull requests created across all configured repositories in the window.
+     */
+    created: number;
+    /**
+     * RFC3339 time the GitHub counts were fetched.
+     */
+    fetched_at?: string;
+    /**
+     * Pull requests merged across all configured repositories in the window.
+     */
+    merged: number;
+    /**
+     * Per-repository breakdown.
+     */
+    repos?: Array<VelocityPrRepo> | null;
+    /**
+     * True when a refresh failed and these counts are a retained last-good reading.
+     */
+    stale?: boolean;
+    /**
+     * Why PR counts are unavailable, when Available is false.
+     */
+    unavailable_reason?: string;
+};
+
+export type VelocityRuns = {
+    /**
+     * Per-formula breakdown, largest first, capped with an 'other' rollup.
+     */
+    by_formula?: Array<VelocityFormulaRuns> | null;
+    /**
+     * Workflow roots closed in the window across all stores.
+     */
+    completed: number;
+    /**
+     * True when at least one bead store could not be read.
+     */
+    partial?: boolean;
+    /**
+     * Stores or reads that were skipped.
+     */
+    partial_reasons?: Array<string> | null;
+};
+
 export type WaitListBody = {
     /**
      * True when the lookup hit the per-scope cap and the list is partial.
@@ -14568,7 +14770,12 @@ export type GetV0CityByCityNameOrdersData = {
          */
         cityName: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Include disabled orders. Default lists only the active set.
+         */
+        all?: boolean;
+    };
     url: '/v0/city/{cityName}/orders';
 };
 
@@ -14754,6 +14961,52 @@ export type GetV0CityByCityNameOrdersHistoryResponses = {
 };
 
 export type GetV0CityByCityNameOrdersHistoryResponse = GetV0CityByCityNameOrdersHistoryResponses[keyof GetV0CityByCityNameOrdersHistoryResponses];
+
+export type GetV0CityByCityNameOrdersByNameFilesData = {
+    body?: never;
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+        /**
+         * Order name or scoped name.
+         */
+        name: string;
+    };
+    query?: never;
+    url: '/v0/city/{cityName}/orders/{name}/files';
+};
+
+export type GetV0CityByCityNameOrdersByNameFilesErrors = {
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Conflict
+     */
+    409: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+};
+
+export type GetV0CityByCityNameOrdersByNameFilesError = GetV0CityByCityNameOrdersByNameFilesErrors[keyof GetV0CityByCityNameOrdersByNameFilesErrors];
+
+export type GetV0CityByCityNameOrdersByNameFilesResponses = {
+    /**
+     * OK
+     */
+    200: OrderFilesBody;
+};
+
+export type GetV0CityByCityNameOrdersByNameFilesResponse = GetV0CityByCityNameOrdersByNameFilesResponses[keyof GetV0CityByCityNameOrdersByNameFilesResponses];
 
 export type GetV0CityByCityNamePacksData = {
     body?: never;
@@ -18322,6 +18575,53 @@ export type GetV0CityByCityNameUsageResponses = {
 };
 
 export type GetV0CityByCityNameUsageResponse = GetV0CityByCityNameUsageResponses[keyof GetV0CityByCityNameUsageResponses];
+
+export type GetV0CityByCityNameVelocityData = {
+    body?: never;
+    path: {
+        /**
+         * City name.
+         */
+        cityName: string;
+    };
+    query?: {
+        /**
+         * Aggregation window in hours. Defaults to 72.
+         */
+        window_hours?: number;
+    };
+    url: '/v0/city/{cityName}/velocity';
+};
+
+export type GetV0CityByCityNameVelocityErrors = {
+    /**
+     * Not Found
+     */
+    404: ErrorModel;
+    /**
+     * Unprocessable Entity
+     */
+    422: ErrorModel;
+    /**
+     * Internal Server Error
+     */
+    500: ErrorModel;
+    /**
+     * Service Unavailable
+     */
+    503: ErrorModel;
+};
+
+export type GetV0CityByCityNameVelocityError = GetV0CityByCityNameVelocityErrors[keyof GetV0CityByCityNameVelocityErrors];
+
+export type GetV0CityByCityNameVelocityResponses = {
+    /**
+     * OK
+     */
+    200: VelocityBody;
+};
+
+export type GetV0CityByCityNameVelocityResponse = GetV0CityByCityNameVelocityResponses[keyof GetV0CityByCityNameVelocityResponses];
 
 export type GetV0CityByCityNameWaitByIdData = {
     body?: never;

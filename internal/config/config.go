@@ -302,6 +302,8 @@ type City struct {
 	WebhookPolicy WebhookPolicyConfig `toml:"webhooks,omitempty"`
 	// GitHub configures GitHub-facing repository monitors.
 	GitHub GitHubConfig `toml:"github,omitempty"`
+	// Dashboard configures server-side data sources for the web dashboard.
+	Dashboard DashboardConfig `toml:"dashboard,omitempty"`
 	// ExtMsg configures the external-messaging fabric (default routes
 	// for inbound conversations with no binding).
 	ExtMsg ExtMsgConfig `toml:"extmsg,omitempty"`
@@ -4595,6 +4597,9 @@ func Load(fs fsys.FS, path string) (*City, error) {
 		return nil, err
 	}
 	if err := ValidateGitHubPRMonitors(cfg); err != nil {
+		return nil, err
+	}
+	if err := ValidateDashboardConfig(cfg); err != nil {
 		return nil, err
 	}
 	if err := ValidateDoltConfig(cfg, path); err != nil {

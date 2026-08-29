@@ -28,8 +28,11 @@ type OrderListOutput struct {
 }
 
 // humaHandleOrderList is the Huma-typed handler for GET /v0/orders.
-func (s *Server) humaHandleOrderList(_ context.Context, _ *OrderListInput) (*OrderListOutput, error) {
+func (s *Server) humaHandleOrderList(_ context.Context, input *OrderListInput) (*OrderListOutput, error) {
 	aa := s.state.Orders()
+	if input.All {
+		aa = s.state.OrdersAll()
+	}
 	resp := make([]orderResponse, len(aa))
 	for i, a := range aa {
 		resp[i] = toOrderResponse(a)

@@ -35,6 +35,9 @@ var beadCopyExemptFields = map[string]string{
 		"cannot mint dangling cross-boundary edges. The edges it would have produced are witnessed by verifyInfraCopy's DepList comparison.",
 	"Dependencies": "create-time dependency shorthand, stripped by infraMigrationRow for the same reason as Needs, " +
 		"and witnessed the same way — through the source's own materialized dep rows rather than the create-time field.",
+	"ClosedAt": "store-stamped close timestamp that Create paths cannot carry (bd mints it on close, not on create), " +
+		"so a copied closed row necessarily arrives without it. Close-time reads (ListQuery.ClosedAfter) fall back to " +
+		"UpdatedAt when ClosedAt is nil, and UpdatedAt IS witnessed — so the copy stays faithful for every close-time read.",
 }
 
 // infraEqualityFixture is a source row with every durable field populated to a
@@ -44,6 +47,7 @@ var beadCopyExemptFields = map[string]string{
 func infraEqualityFixture() beads.Bead {
 	created := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 	deferred := created.Add(72 * time.Hour)
+	closed := created.Add(36 * time.Hour)
 	priority := 2
 	blocked := false
 	return beads.Bead{
@@ -66,6 +70,7 @@ func infraEqualityFixture() beads.Bead {
 		Ephemeral:    true,
 		NoHistory:    true,
 		DeferUntil:   &deferred,
+		ClosedAt:     &closed,
 		IsBlocked:    &blocked,
 		Revision:     7,
 		ClaimFence:   3,
@@ -122,6 +127,7 @@ func beadCopyExemptMutations() map[string]func(beads.Bead) beads.Bead {
 		"ClaimFence":   func(b beads.Bead) beads.Bead { b.ClaimFence = 0; return b },
 		"Needs":        func(b beads.Bead) beads.Bead { b.Needs = nil; return b },
 		"Dependencies": func(b beads.Bead) beads.Bead { b.Dependencies = nil; return b },
+		"ClosedAt":     func(b beads.Bead) beads.Bead { b.ClosedAt = nil; return b },
 	}
 }
 

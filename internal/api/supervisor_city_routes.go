@@ -37,6 +37,7 @@ func (sm *SupervisorMux) registerCityRoutes() {
 	cityGet(sm, "/status", (*Server).humaHandleStatus, errorStatuses(http.StatusNotFound, http.StatusServiceUnavailable))
 	cityGet(sm, "/health", (*Server).humaHandleHealth, errorStatuses(http.StatusNotFound))
 	cityGet(sm, "/usage", (*Server).humaHandleUsage, errorStatuses(http.StatusNotFound, http.StatusServiceUnavailable))
+	cityGet(sm, "/velocity", (*Server).humaHandleVelocity, errorStatuses(http.StatusNotFound, http.StatusServiceUnavailable))
 
 	// City detail.
 	cityGet(sm, "", (*Server).humaHandleCityGet, errorStatuses(http.StatusNotFound))
@@ -289,6 +290,10 @@ func (sm *SupervisorMux) registerCityRoutes() {
 	cityGet(sm, "/orders/history", (*Server).humaHandleOrderHistory, errorStatuses(http.StatusBadRequest, http.StatusNotFound, http.StatusServiceUnavailable))
 	cityGet(sm, "/order/history/{bead_id}", (*Server).humaHandleOrderHistoryDetail, errorStatuses(http.StatusNotFound, http.StatusServiceUnavailable))
 	cityGet(sm, "/order/{name}", (*Server).humaHandleOrderGet, errorStatuses(http.StatusNotFound, http.StatusConflict))
+	// Registered under /orders/{name}/files (plural) because a
+	// /order/{name}/files pattern is ambiguous with /order/history/{bead_id}
+	// in ServeMux ("/order/history/files" would match both).
+	cityGet(sm, "/orders/{name}/files", (*Server).humaHandleOrderFiles, errorStatuses(http.StatusNotFound, http.StatusConflict))
 	cityPost(sm, "/order/{name}/enable", (*Server).humaHandleOrderEnable, errorStatuses(http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusConflict, http.StatusNotImplemented))
 	cityPost(sm, "/order/{name}/disable", (*Server).humaHandleOrderDisable, errorStatuses(http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusConflict, http.StatusNotImplemented))
 	// Typed operator path to fire a trigger="webhook" order directly with typed

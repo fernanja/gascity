@@ -12,6 +12,11 @@ import {
   getV0CityByCityNameHealth,
   getV0CityByCityNameMail,
   getV0CityByCityNameMailThreadById,
+  getV0CityByCityNameOrderHistoryByBeadId,
+  getV0CityByCityNameOrders,
+  getV0CityByCityNameOrdersByNameFiles,
+  getV0CityByCityNameOrdersCheck,
+  getV0CityByCityNameOrdersHistory,
   getV0CityByCityNameRigs,
   getV0CityByCityNameRunsCensus,
   getV0CityByCityNameSessionByIdPending,
@@ -19,6 +24,7 @@ import {
   getV0CityByCityNameSessions,
   getV0CityByCityNameStatus,
   getV0CityByCityNameUsage,
+  getV0CityByCityNameVelocity,
   getV0CityByCityNameWorkflowByWorkflowId,
   patchV0CityByCityNameBeadById,
   postV0CityByCityNameBeadByIdClose,
@@ -56,6 +62,11 @@ import type {
   Message,
   ListBodySessionResponse,
   OkResponseBody,
+  OrderCheckListBody,
+  OrderFilesBody,
+  OrderHistoryDetailResponse,
+  OrderHistoryListBody,
+  OrderListBody,
   PostV0CityByCityNameMailByIdArchiveData,
   PostV0CityByCityNameMailByIdMarkUnreadData,
   PostV0CityByCityNameMailByIdReadData,
@@ -69,6 +80,7 @@ import type {
   SlingResponse,
   SupervisorCitiesOutputBody,
   UsageBody,
+  VelocityBody,
   StreamSessionData,
   WorkflowSnapshotResponse,
 } from 'gas-city-dashboard-shared/gc-supervisor';
@@ -98,7 +110,22 @@ export interface SupervisorApi {
   cityHealth(cityName: string): Promise<GetV0CityByCityNameHealthResponse>;
   cityStatus(cityName: string): Promise<GetV0CityByCityNameStatusResponse>;
   cityUsage(cityName: string): Promise<UsageBody>;
+  velocity(cityName: string, windowHours?: number): Promise<VelocityBody>;
   runCensus(cityName: string): Promise<RunsCensusOutputBody>;
+  listOrders(cityName: string, all?: boolean): Promise<OrderListBody>;
+  ordersCheck(cityName: string, fresh?: boolean): Promise<OrderCheckListBody>;
+  orderHistory(
+    cityName: string,
+    scopedName: string,
+    limit?: number,
+    before?: string,
+  ): Promise<OrderHistoryListBody>;
+  orderHistoryDetail(
+    cityName: string,
+    beadId: string,
+    storeRef?: string,
+  ): Promise<OrderHistoryDetailResponse>;
+  orderFiles(cityName: string, name: string): Promise<OrderFilesBody>;
   listCities(): Promise<SupervisorCitiesOutputBody>;
   listAgents(cityName: string): Promise<ListBodyAgentResponse>;
   listRigs(cityName: string): Promise<ListBodyRigResponse>;
@@ -243,6 +270,70 @@ export function createSupervisorApi(options: CreateSupervisorApiOptions = {}): S
           query: { aggregate_only: true },
         }) as Promise<SupervisorResult<UsageBody>>,
         'gc supervisor usage response was empty',
+      );
+    },
+    velocity(cityName, windowHours) {
+      return unwrapSupervisorResult<VelocityBody>(
+        getV0CityByCityNameVelocity({
+          client,
+          path: { cityName },
+          ...(windowHours === undefined ? {} : { query: { window_hours: windowHours } }),
+        }) as Promise<SupervisorResult<VelocityBody>>,
+        'gc supervisor velocity response was empty',
+      );
+    },
+    listOrders(cityName, all) {
+      return unwrapSupervisorResult<OrderListBody>(
+        getV0CityByCityNameOrders({
+          client,
+          path: { cityName },
+          ...(all === undefined ? {} : { query: { all } }),
+        }) as Promise<SupervisorResult<OrderListBody>>,
+        'gc supervisor orders response was empty',
+      );
+    },
+    ordersCheck(cityName, fresh) {
+      return unwrapSupervisorResult<OrderCheckListBody>(
+        getV0CityByCityNameOrdersCheck({
+          client,
+          path: { cityName },
+          ...(fresh === undefined ? {} : { query: { fresh } }),
+        }) as Promise<SupervisorResult<OrderCheckListBody>>,
+        'gc supervisor orders check response was empty',
+      );
+    },
+    orderHistory(cityName, scopedName, limit, before) {
+      const query: { scoped_name: string; limit?: number; before?: string } = {
+        scoped_name: scopedName,
+      };
+      if (limit !== undefined) query.limit = limit;
+      if (before !== undefined) query.before = before;
+      return unwrapSupervisorResult<OrderHistoryListBody>(
+        getV0CityByCityNameOrdersHistory({
+          client,
+          path: { cityName },
+          query,
+        }) as Promise<SupervisorResult<OrderHistoryListBody>>,
+        'gc supervisor order history response was empty',
+      );
+    },
+    orderHistoryDetail(cityName, beadId, storeRef) {
+      return unwrapSupervisorResult<OrderHistoryDetailResponse>(
+        getV0CityByCityNameOrderHistoryByBeadId({
+          client,
+          path: { cityName, bead_id: beadId },
+          ...(storeRef === undefined ? {} : { query: { store_ref: storeRef } }),
+        }) as Promise<SupervisorResult<OrderHistoryDetailResponse>>,
+        'gc supervisor order history detail response was empty',
+      );
+    },
+    orderFiles(cityName, name) {
+      return unwrapSupervisorResult<OrderFilesBody>(
+        getV0CityByCityNameOrdersByNameFiles({
+          client,
+          path: { cityName, name },
+        }) as Promise<SupervisorResult<OrderFilesBody>>,
+        'gc supervisor order files response was empty',
       );
     },
     runCensus(cityName) {

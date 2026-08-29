@@ -35,6 +35,7 @@ const EXPLICIT_ROUTES: ReadonlyArray<NavRoute> = [
   { to: '/agents', label: 'Agents', order: 20 },
   { to: '/beads', label: 'Beads', order: 30 },
   { to: '/runs', label: 'Runs', order: 40 },
+  { to: '/orders', label: 'Orders', order: 45 },
   { to: '/mail', label: 'Mail', order: 50 },
 ];
 

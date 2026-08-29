@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"slices"
 	"strconv"
@@ -554,20 +553,8 @@ func writeGitHubPRBackfillText(stdout io.Writer, result githubPRBackfillResult) 
 	}
 }
 
+// resolveGitHubToken delegates to the shared githubmonitor resolver so token
+// precedence stays identical between the CLI and the API server.
 func resolveGitHubToken(ctx context.Context) (string, error) {
-	for _, key := range []string{"GITHUB_TOKEN", "GH_TOKEN"} {
-		if token := strings.TrimSpace(os.Getenv(key)); token != "" {
-			return token, nil
-		}
-	}
-	cmd := exec.CommandContext(ctx, "gh", "auth", "token")
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("GitHub token not found in GITHUB_TOKEN/GH_TOKEN and `gh auth token` failed: %w", err)
-	}
-	token := strings.TrimSpace(string(out))
-	if token == "" {
-		return "", errors.New("GitHub token not found: `gh auth token` returned empty output")
-	}
-	return token, nil
+	return githubmonitor.ResolveToken(ctx)
 }

@@ -6,11 +6,13 @@ import type {
   StatusBody,
   UsageBody,
   UsageTotals,
+  VelocityBody,
 } from 'gas-city-dashboard-shared/gc-supervisor';
 import { activeCityOrThrow, getActiveCity } from '../api/cityBase';
 import { useAttentionModel } from '../attention/context';
 import {
   ActivityTrace,
+  BarList,
   ContextMeters,
   Gauge,
   InstrumentNote,
@@ -19,6 +21,7 @@ import {
   RunRings,
   StatTile,
   StatusLamps,
+  type BarListItem,
   type LampState,
 } from '../components/cockpit/Instruments';
 import {
@@ -36,6 +39,7 @@ const POLL_MS = 15_000;
 const MAX_TRACE_SAMPLES = 48;
 const MAX_RINGS = 8;
 const SECONDS_PER_DAY = 86_400;
+const VELOCITY_WINDOW_HOURS = 72;
 
 export function CockpitHomePage() {
   const city = getActiveCity();
@@ -56,6 +60,9 @@ export function CockpitHomePage() {
   const sessionsState = useCachedData<ListBodySessionResponse>(`cockpit:sessions:${cityKey}`, () =>
     supervisorApi().listSessions(activeCityOrThrow('cockpit sessions read')),
   );
+  const velocityState = useCachedData<VelocityBody>(`cockpit:velocity:${cityKey}`, () =>
+    supervisorApi().velocity(activeCityOrThrow('cockpit velocity read'), VELOCITY_WINDOW_HOURS),
+  );
   const runSummary = useRunSummary();
   const attention = useAttentionModel();
 
@@ -63,11 +70,13 @@ export function CockpitHomePage() {
   usePoll(statusState.refresh, statusState.loading, pausedRef);
   usePoll(runsState.refresh, runsState.loading, pausedRef);
   usePoll(sessionsState.refresh, sessionsState.loading, pausedRef);
+  usePoll(velocityState.refresh, velocityState.loading, pausedRef);
 
   const usageReading = useFrozenWhilePaused(useReadingSnapshot(usageState, cityKey), paused);
   const statusReading = useFrozenWhilePaused(useReadingSnapshot(statusState, cityKey), paused);
   const runsReading = useFrozenWhilePaused(useReadingSnapshot(runsState, cityKey), paused);
   const sessionsReading = useFrozenWhilePaused(useReadingSnapshot(sessionsState, cityKey), paused);
+  const velocityReading = useFrozenWhilePaused(useReadingSnapshot(velocityState, cityKey), paused);
   const runProjection = useFrozenWhilePaused(
     {
       source: runSummary.source,
@@ -81,6 +90,7 @@ export function CockpitHomePage() {
   const status = statusReading.data;
   const canonicalRuns = runsReading.data;
   const sessions = sessionsReading.data;
+  const velocity = velocityReading.data;
   const richRuns = runProjection.source;
 
   const [activitySamples, setActivitySamples] = useState<number[]>([]);
@@ -281,6 +291,56 @@ export function CockpitHomePage() {
     'sessions',
     sessions?.partial ? 'session list is partial' : undefined,
   );
+  const velocityPartialReasons = [
+    ...(velocity?.runs.partial_reasons ?? []),
+    ...(velocity?.beads.partial_reasons ?? []),
+  ];
+  const velocityNote = readingNote(
+    velocityReading,
+    'velocity',
+    velocityPartialReasons.length > 0
+      ? `partial · ${[...new Set(velocityPartialReasons)].join(' · ')}`
+      : undefined,
+  );
+  const prs = velocity?.prs;
+  const prsAvailable = prs?.available === true;
+  const prsNote =
+    prs === undefined
+      ? undefined
+      : !prs.available
+        ? prs.unavailable_reason || 'PR counts unavailable'
+        : prs.stale
+          ? 'stale · latest GitHub refresh failed'
+          : undefined;
+  const runsByFormula: BarListItem[] = useMemo(
+    () =>
+      (velocity?.runs.by_formula ?? []).map((formula) => ({
+        key: formula.formula,
+        label: formula.formula,
+        value: formula.completed,
+        segments: [
+          { key: 'passed', value: formula.passed, className: 'bg-ok/70' },
+          { key: 'failed', value: formula.failed, className: 'bg-warn/70' },
+          { key: 'skipped', value: formula.skipped, className: 'bg-fg/25' },
+        ],
+      })),
+    [velocity?.runs.by_formula],
+  );
+  const beadsByKind: BarListItem[] = useMemo(
+    () =>
+      (velocity?.beads.by_kind ?? []).map((group) => ({
+        key: group.group,
+        label: group.group,
+        value: group.closed,
+      })),
+    [velocity?.beads.by_kind],
+  );
+  // Wisps (order-run churn) outnumber durable closures ~3:1, so they are a
+  // note beside the chart, never a bar that flattens every other bucket.
+  const wispNote =
+    velocity !== undefined && velocity.beads.wisps_closed > 0
+      ? `+${formatCompact(velocity.beads.wisps_closed)} order wisps closed · not charted`
+      : undefined;
   const activeSessionsNote = activeSessionsFromStatus === undefined ? sessionsNote : statusNote;
   const ringsNote =
     richRuns === undefined
@@ -404,6 +464,55 @@ export function CockpitHomePage() {
           />
         </div>
         {usageNote && <InstrumentNote>{usageNote}</InstrumentNote>}
+      </section>
+
+      <section className="mb-8" aria-labelledby="velocity72-title">
+        <h2 id="velocity72-title" className="mb-2 text-label uppercase tracking-wider text-fg-faint">
+          last 72 hours · velocity
+        </h2>
+        <div
+          className="grid items-start justify-items-center gap-x-4 gap-y-4 [grid-template-columns:repeat(auto-fit,minmax(120px,1fr))]"
+          data-testid="velocity-grid"
+        >
+          <StatTile
+            label="prs merged"
+            value={prsAvailable && prs !== undefined ? formatCount(prs.merged) : null}
+            note={prsNote}
+          />
+          <StatTile
+            label="prs created"
+            value={prsAvailable && prs !== undefined ? formatCount(prs.created) : null}
+          />
+          <StatTile
+            label="runs completed"
+            value={velocity !== undefined ? formatCount(velocity.runs.completed) : null}
+          />
+          <StatTile
+            label="beads closed"
+            value={velocity !== undefined ? formatCount(velocity.beads.closed) : null}
+          />
+        </div>
+        {velocity !== undefined && (
+          <div className="mt-6 grid gap-x-10 gap-y-6 lg:grid-cols-2" data-testid="velocity-charts">
+            <div>
+              <h3 className="mb-2 text-label uppercase tracking-wider text-fg-faint">
+                runs completed · by formula
+              </h3>
+              <BarList items={runsByFormula} emptyLabel="no runs completed in this window" />
+            </div>
+            <div>
+              <h3 className="mb-2 text-label uppercase tracking-wider text-fg-faint">
+                bead completions · by kind
+              </h3>
+              <BarList
+                items={beadsByKind}
+                emptyLabel="no beads closed in this window"
+                note={wispNote}
+              />
+            </div>
+          </div>
+        )}
+        {velocityNote && <InstrumentNote>{velocityNote}</InstrumentNote>}
       </section>
 
       <section className="mb-8" aria-labelledby="run-state-title">

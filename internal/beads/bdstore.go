@@ -775,6 +775,7 @@ type bdIssue struct {
 	Priority     *int         `json:"priority,omitempty"`
 	CreatedAt    time.Time    `json:"created_at"`
 	UpdatedAt    time.Time    `json:"updated_at"`
+	ClosedAt     *time.Time   `json:"closed_at,omitempty"`
 	Assignee     string       `json:"assignee"`
 	From         string       `json:"from"`
 	ParentID     string       `json:"parent"`
@@ -942,6 +943,7 @@ func (b *bdIssue) toBead() Bead {
 		Priority:     cloneIntPtr(b.Priority),
 		CreatedAt:    b.CreatedAt.Truncate(time.Second),
 		UpdatedAt:    b.UpdatedAt.Truncate(time.Second),
+		ClosedAt:     truncateTimePtr(b.ClosedAt),
 		Assignee:     b.Assignee,
 		From:         from,
 		ParentID:     parentID,
@@ -2514,6 +2516,9 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	if !serverQuery.CreatedBefore.IsZero() {
 		args = append(args, "--created-before", serverQuery.CreatedBefore.Format(time.RFC3339Nano))
 	}
+	if !serverQuery.ClosedAfter.IsZero() {
+		args = append(args, "--closed-after", serverQuery.ClosedAfter.Format(time.RFC3339Nano))
+	}
 	args = append(args, "--include-infra", "--include-gates")
 	if bdListShouldIncludeTemplates(query) {
 		args = append(args, "--include-templates")
@@ -2572,7 +2577,7 @@ func bdListRequiresClientLimit(query, serverQuery ListQuery, clientFilteredAssig
 	if serverQuery.Sort == SortCreatedAsc || clientFilteredAssignees {
 		return true
 	}
-	if len(serverQuery.Metadata) > 0 || !serverQuery.CreatedBefore.IsZero() || !serverQuery.UpdatedBefore.IsZero() {
+	if len(serverQuery.Metadata) > 0 || !serverQuery.CreatedBefore.IsZero() || !serverQuery.UpdatedBefore.IsZero() || !serverQuery.ClosedAfter.IsZero() {
 		return true
 	}
 	// bd list exposes no compound (created_at, id) seek flag; the boundary is
@@ -2734,6 +2739,7 @@ func canApplyWispsServerLimit(query ListQuery) bool {
 	return (query.Sort == SortDefault || query.Sort == SortCreatedDesc) &&
 		query.CreatedBefore.IsZero() &&
 		query.UpdatedBefore.IsZero() &&
+		query.ClosedAfter.IsZero() &&
 		len(query.Metadata) == 0 &&
 		query.SeekAfter == nil
 }

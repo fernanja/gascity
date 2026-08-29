@@ -1,6 +1,7 @@
 export const GC_EVENT_PREFIX = {
   bead: 'bead.',
   session: 'session.',
+  order: 'order.',
 } as const;
 
 export interface ClientErrorReport {

@@ -3,6 +3,7 @@ import { cleanup, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import {
   ActivityTrace,
+  BarList,
   Gauge,
   Odometer,
   PipelineBar,
@@ -149,5 +150,52 @@ describe('cockpit instruments', () => {
     );
     expect(screen.getByRole('link', { name: 'store: warning, maintenance overdue' })).toBeTruthy();
     expect(screen.getByRole('link', { name: 'live feed: unknown, disconnected' })).toBeTruthy();
+  });
+});
+
+describe('bar list', () => {
+  afterEach(() => cleanup());
+
+  it('renders one labelled row per item with proportional widths', () => {
+    const { container } = render(
+      <BarList
+        items={[
+          { key: 'build-basic', label: 'build-basic', value: 40 },
+          { key: 'do-work', label: 'do-work', value: 20 },
+        ]}
+      />,
+    );
+    expect(screen.getByRole('status', { name: 'build-basic: 40' })).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'do-work: 20' })).toBeTruthy();
+    const segments = container.querySelectorAll('[data-testid="bar-list-segment"]');
+    expect(segments).toHaveLength(2);
+    expect((segments[0] as HTMLElement).style.width).toBe('100%');
+    expect((segments[1] as HTMLElement).style.width).toBe('50%');
+  });
+
+  it('renders outcome segments and drops zero-width ones', () => {
+    const { container } = render(
+      <BarList
+        items={[
+          {
+            key: 'fix-loop',
+            label: 'fix-loop',
+            value: 10,
+            segments: [
+              { key: 'passed', value: 8, className: 'bg-ok/70' },
+              { key: 'failed', value: 2, className: 'bg-warn/70' },
+              { key: 'skipped', value: 0, className: 'bg-fg/25' },
+            ],
+          },
+        ]}
+      />,
+    );
+    const segments = container.querySelectorAll('[data-testid="bar-list-segment"]');
+    expect(segments).toHaveLength(2);
+  });
+
+  it('shows the empty label when there is nothing to chart', () => {
+    render(<BarList items={[]} emptyLabel="no runs completed in this window" />);
+    expect(screen.getByText('no runs completed in this window')).toBeTruthy();
   });
 });

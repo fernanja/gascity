@@ -318,6 +318,102 @@ func TestListQueryUpdatedBeforeMatchesReferenceTimestampBoundaries(t *testing.T)
 	}
 }
 
+func TestListQueryClosedAfterMatchesCloseTimeBoundaries(t *testing.T) {
+	cutoff := time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)
+	timePtr := func(v time.Time) *time.Time { return &v }
+	tests := []struct {
+		name string
+		bead Bead
+		want bool
+	}{
+		{
+			name: "closed at cutoff matches (inclusive)",
+			bead: Bead{
+				ID:        "closed-equal",
+				Status:    "closed",
+				CreatedAt: cutoff.Add(-time.Hour),
+				ClosedAt:  timePtr(cutoff),
+			},
+			want: true,
+		},
+		{
+			name: "closed after cutoff matches",
+			bead: Bead{
+				ID:        "closed-after",
+				Status:    "closed",
+				CreatedAt: cutoff.Add(-time.Hour),
+				ClosedAt:  timePtr(cutoff.Add(time.Hour)),
+			},
+			want: true,
+		},
+		{
+			name: "closed before cutoff is excluded",
+			bead: Bead{
+				ID:        "closed-before",
+				Status:    "closed",
+				CreatedAt: cutoff.Add(-2 * time.Hour),
+				ClosedAt:  timePtr(cutoff.Add(-time.Nanosecond)),
+			},
+			want: false,
+		},
+		{
+			name: "open bead never matches even with recent update",
+			bead: Bead{
+				ID:        "still-open",
+				Status:    "open",
+				CreatedAt: cutoff.Add(-time.Hour),
+				UpdatedAt: cutoff.Add(time.Hour),
+			},
+			want: false,
+		},
+		{
+			name: "nil ClosedAt falls back to UpdatedAt after cutoff",
+			bead: Bead{
+				ID:        "legacy-closed-recent",
+				Status:    "closed",
+				CreatedAt: cutoff.Add(-time.Hour),
+				UpdatedAt: cutoff.Add(time.Minute),
+			},
+			want: true,
+		},
+		{
+			name: "nil ClosedAt falls back to UpdatedAt before cutoff",
+			bead: Bead{
+				ID:        "legacy-closed-old",
+				Status:    "closed",
+				CreatedAt: cutoff.Add(-2 * time.Hour),
+				UpdatedAt: cutoff.Add(-time.Hour),
+			},
+			want: false,
+		},
+		{
+			name: "nil ClosedAt and zero UpdatedAt fall back to CreatedAt",
+			bead: Bead{
+				ID:        "legacy-closed-created-only",
+				Status:    "closed",
+				CreatedAt: cutoff.Add(time.Minute),
+			},
+			want: true,
+		},
+	}
+
+	query := ListQuery{ClosedAfter: cutoff, IncludeClosed: true}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := query.Matches(tt.bead); got != tt.want {
+				t.Fatalf("Matches() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestListQueryHasFilterIncludesClosedAfter(t *testing.T) {
+	query := ListQuery{ClosedAfter: time.Date(2026, 8, 26, 12, 0, 0, 0, time.UTC)}
+	if !query.HasFilter() {
+		t.Fatal("HasFilter() = false, want true for ClosedAfter")
+	}
+}
+
 func TestListQueryMatchesIgnoresUpdatedAtWhenUpdatedBeforeZero(t *testing.T) {
 	bead := Bead{
 		ID:        "future-update",

@@ -56,6 +56,70 @@ export function StatTile({
   );
 }
 
+export interface BarListItem {
+  key: string;
+  label: string;
+  value: number;
+  /** Optional sub-segments (e.g. pass/fail/skipped). Widths are scaled against
+   * the list-wide max so rows stay comparable; segments subdivide the row. */
+  segments?: readonly { key: string; value: number; className: string }[] | undefined;
+}
+
+export function BarList({
+  items,
+  emptyLabel,
+  note,
+}: {
+  items: readonly BarListItem[];
+  emptyLabel?: string | undefined;
+  note?: string | undefined;
+}) {
+  const max = Math.max(1, ...items.map((item) => item.value));
+  return (
+    <div data-testid="bar-list">
+      {items.length === 0 ? (
+        <InstrumentNote>{emptyLabel ?? 'nothing in this window'}</InstrumentNote>
+      ) : (
+        <ol className="m-0 list-none space-y-1.5 p-0">
+          {items.map((item) => {
+            const segments =
+              item.segments !== undefined && item.segments.length > 0
+                ? item.segments.filter((segment) => segment.value > 0)
+                : [{ key: 'all', value: item.value, className: 'bg-fg/60' }];
+            return (
+              <li
+                key={item.key}
+                role="status"
+                aria-label={`${item.label}: ${item.value}`}
+                className="grid min-h-6 grid-cols-[minmax(6rem,2fr)_3fr_2.75rem] items-center gap-x-3"
+              >
+                <span
+                  className="truncate text-label uppercase tracking-wider text-fg-faint"
+                  title={item.label}
+                >
+                  {item.label}
+                </span>
+                <span className="flex h-2 gap-px overflow-hidden rounded-sm" aria-hidden>
+                  {segments.map((segment) => (
+                    <span
+                      key={segment.key}
+                      data-testid="bar-list-segment"
+                      className={`block ${segment.className} transition-[width] duration-300 motion-reduce:transition-none`}
+                      style={{ width: `${(Math.max(0, segment.value) / max) * 100}%` }}
+                    />
+                  ))}
+                </span>
+                <span className="text-right text-label text-fg tnum">{item.value}</span>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+      {note && <InstrumentNote>{note}</InstrumentNote>}
+    </div>
+  );
+}
+
 export function Gauge({
   label,
   value,
