@@ -254,4 +254,4 @@ require (
 
 // human-operator pin (gc-kjk3l follow-up): v1.2.2 + PR#4926 BlockedQuerier/IsBlockedBatch
 // subset only; no migrations >0053. See deps.env BD_FORK_REPLACE_VERSION.
-replace github.com/steveyegge/beads => github.com/fernanja/beads v1.2.102
+replace github.com/steveyegge/beads => github.com/fernanja/beads v1.2.104
