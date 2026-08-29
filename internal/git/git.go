@@ -201,6 +201,30 @@ func (g *Git) HasUnreachableCommitsResult() (bool, error) {
 	return strings.TrimSpace(out) != "", nil
 }
 
+// IsLinkedWorktree reports whether this working directory is a linked
+// worktree (created by `git worktree add`) rather than the repository's main
+// checkout, by comparing the resolved --git-dir and --git-common-dir. In the
+// main checkout the two are the same directory; in a linked worktree
+// --git-dir is the per-worktree gitdir under <common>/worktrees/<name>.
+//
+// The distinction matters to callers deciding what `git worktree remove`
+// can destroy: per-worktree state (the checkout, its index, HEAD) is lost,
+// while everything in the common gitdir — objects, refs/heads, and shared
+// refs like refs/stash — survives.
+func (g *Git) IsLinkedWorktree() (bool, error) {
+	out, err := g.run("rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir")
+	if err != nil {
+		return false, fmt.Errorf("resolving git dirs: %w", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) != 2 {
+		return false, fmt.Errorf("resolving git dirs: unexpected rev-parse output %q", out)
+	}
+	gitDir := filepath.Clean(strings.TrimSpace(lines[0]))
+	commonDir := filepath.Clean(strings.TrimSpace(lines[1]))
+	return gitDir != commonDir, nil
+}
+
 // HasStashes reports whether the repository has stashed work.
 // If the probe fails, it returns true to fail closed.
 func (g *Git) HasStashes() bool {

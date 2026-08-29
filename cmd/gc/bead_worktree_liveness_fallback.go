@@ -21,7 +21,16 @@ const (
 // the controller tick, so a process-table query that hangs must not stall it. A
 // timeout yields no records, which the caller treats as an indeterminate scan
 // and fails closed on — the same posture as a missing /proc.
-const liveScanFallbackTimeout = 20 * time.Second
+//
+// 45s, up from 20s: lsof -a -d cwd completes in 0.5-4s on an idle macOS host
+// but degrades badly under the process churn of a dispatch batch (dozens of
+// workers, node, playwright, docker children) — exactly the passes where the
+// reaper most needs a real answer. At 20s the scan flapped to
+// DeadlineExceeded in load bursts, and each flap re-announced every candidate
+// as "liveness scan unavailable" (2 episodes produced 253 edge-triggered
+// events on 2026-08-29, gc-vhzejz). A flap only delays reaping (fail closed),
+// so the cost of the longer bound is one slower tick under load, not risk.
+const liveScanFallbackTimeout = 45 * time.Second
 
 // liveWorktreeCwdEnumerator lists the working directory of every process this
 // user can see, in lsof field output: "p<pid>" per process, "f<fd>" per

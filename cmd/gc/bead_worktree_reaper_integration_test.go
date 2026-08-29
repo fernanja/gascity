@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -276,5 +277,48 @@ func TestReapClosedBeadWorktrees_SkipsOpenBead(t *testing.T) {
 	}
 	if _, err := os.Stat(wt); err != nil {
 		t.Fatalf("worktree for open bead %s was removed: %v", wt, err)
+	}
+}
+
+// TestReapClosedBeadWorktrees_ReapsDespiteSharedRepoStash pins the stash-gate
+// scope fix (gc-vhzejz): refs/stash is a common ref shared by every worktree
+// of the repository, so a stash created in the rig's MAIN checkout is visible
+// to `git stash list` inside every linked worktree — and before the fix that
+// single operator stash protected every closed-bead worktree city-wide,
+// permanently. Removing a linked worktree cannot orphan a stash (refs/stash
+// and its objects live in the common gitdir), so the reaper must reap anyway
+// — and the stash must survive the reap untouched.
+func TestReapClosedBeadWorktrees_ReapsDespiteSharedRepoStash(t *testing.T) {
+	cityPath, rigRoot := initReapRig(t)
+	wt := addClosedWorktree(t, rigRoot, cityPath, "builder", "ga-stash1")
+
+	// Leave a stash in the rig's main checkout — the exact shape of the
+	// founding incident (a human's WIP stash on the rig repo's main branch).
+	if err := os.WriteFile(filepath.Join(rigRoot, "wip.txt"), []byte("wip\n"), 0o644); err != nil {
+		t.Fatalf("wip file: %v", err)
+	}
+	mustGit(t, rigRoot, "stash", "push", "-u", "-m", "operator wip")
+
+	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-stash1", Status: "closed"}}, nil)
+	cfg := reapTestConfig(rigRoot)
+	injectLiveness(t, liveWorktreeState{scanned: true})
+
+	var stderr bytes.Buffer
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{"mrig": store}, nil, false, events.Discard, nil, &stderr)
+
+	if len(report.Reaped) != 1 || report.Reaped[0].BeadID != "ga-stash1" {
+		t.Fatalf("Reaped = %+v, want exactly ga-stash1 despite main-checkout stash\nProtected=%+v\nstderr:\n%s",
+			report.Reaped, report.Protected, stderr.String())
+	}
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Fatalf("worktree %s still present after reap (stat err=%v)", wt, err)
+	}
+	// The reap must not have touched the shared stash.
+	stashOut, err := exec.Command("git", "-C", rigRoot, "stash", "list").CombinedOutput()
+	if err != nil {
+		t.Fatalf("stash list after reap: %v: %s", err, stashOut)
+	}
+	if !strings.Contains(string(stashOut), "operator wip") {
+		t.Fatalf("main-checkout stash missing after reap: %q", stashOut)
 	}
 }

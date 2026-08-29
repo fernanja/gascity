@@ -301,7 +301,28 @@ func reapClosedBeadWorktrees(
 				wg := git.New(worktreePath)
 				hasUncommitted := wg.HasUncommittedWork()
 				hasUnreachable, unreachableErr := wg.HasUnreachableCommitsResult()
-				hasStashes, stashErr := wg.HasStashesResult()
+				// Stash scope: refs/stash is a COMMON ref shared by every
+				// worktree of a repository — it is not in git's per-worktree
+				// ref set — so `git stash list` run inside a linked worktree
+				// reports the whole repository's stashes, and `git worktree
+				// remove` deletes only the checkout, never refs/stash or the
+				// objects it reaches (both live in the common gitdir). A
+				// stash therefore cannot be orphaned by reaping a linked
+				// worktree, and gating on the repo-wide answer turned one
+				// operator stash in the rig's main checkout into a permanent
+				// city-wide reap freeze: every candidate reported the same
+				// stashes=true for as long as the stash existed (gc-vhzejz,
+				// 2026-08-29: 2 stashes on the rig's main checkout protected
+				// all 122 closed-bead worktrees for 10 days). The probe now
+				// runs only when the candidate is NOT a linked worktree —
+				// which discovery from the rig root should never produce —
+				// or when linkedness cannot be determined; both fail closed
+				// toward the old behavior.
+				var hasStashes bool
+				var stashErr error
+				if linked, linkedErr := wg.IsLinkedWorktree(); linkedErr != nil || !linked {
+					hasStashes, stashErr = wg.HasStashesResult()
+				}
 				switch {
 				case unreachableErr != nil:
 					reason = fmt.Sprintf("git probe failed (failing closed): %v", unreachableErr)
