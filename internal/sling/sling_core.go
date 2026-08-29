@@ -473,6 +473,47 @@ func attachedBeadInstructionsDroppedHint(querier BeadQuerier, beadID string, use
 	return fmt.Sprintf("note: bead %s's description is not carried into the formula's rendered context — pass --var context_path=<dir> or --var requirements_path=<doc> to include your instructions, or the formula's brainstorm will not see them.", beadID)
 }
 
+// rootSourceBeadID resolves a workflow root's originating bead id, covering
+// BOTH provenance mechanisms graph.v2 dispatch uses. Most launches stamp
+// gc.source_bead_id directly (doStartGraphWorkflow). The convoy-first path
+// (attachFormulaToBead's InstantiateSlingFormula branch, l.652) deliberately
+// passes an empty sourceBeadID to doStartGraphWorkflow -- per that call
+// site's own comment, "the source is tracked through the input convoy, not
+// gc.source_bead_id" -- so gc.source_bead_id is permanently empty on that
+// path and callers must resolve provenance through gc.input_convoy_id's own
+// dependency edge back to the source bead instead (the "input convoy for
+// <bead>" synthetic convoy pattern). Returns "" if neither resolves (e.g.
+// the convoy was already closed/pruned) -- callers should treat that as
+// "unknown," not "no collision," same fail-open posture as the rest of this
+// advisory hint.
+func rootSourceBeadID(store beads.Store, root beads.Bead) string {
+	if direct := strings.TrimSpace(root.Metadata[beadmeta.SourceBeadIDMetadataKey]); direct != "" {
+		return direct
+	}
+	convoyID := strings.TrimSpace(root.Metadata[beadmeta.InputConvoyIDMetadataKey])
+	if convoyID == "" {
+		return ""
+	}
+	// DepList (not convoy.Dependencies from a plain Get) is the store-
+	// interface-guaranteed accessor: at least one Store implementation
+	// (MemStore, used in this package's own test suite) records dependency
+	// edges in a separate side table that Get never merges into the
+	// returned Bead's own Dependencies field, so relying on that field here
+	// would silently under-resolve on any store with the same shape as the
+	// production BdStore's "bd show" JSON does happen to inline deps, but
+	// this call must work identically across every Store implementation.
+	deps, err := store.DepList(convoyID, "down")
+	if err != nil {
+		return ""
+	}
+	for _, dep := range deps {
+		if id := strings.TrimSpace(dep.DependsOnID); id != "" {
+			return id
+		}
+	}
+	return ""
+}
+
 // liveArtifactRootCollisionHint returns a sling-time diagnostic when a
 // dispatch's --var artifact_root=<path> is already claimed by another LIVE
 // (non-closed) workflow root belonging to a DIFFERENT source bead.
@@ -509,7 +550,7 @@ func liveArtifactRootCollisionHint(store beads.Store, beadID string, userVars []
 		if !sourceworkflow.IsWorkflowRoot(root) {
 			continue
 		}
-		if strings.TrimSpace(root.Metadata[beadmeta.SourceBeadIDMetadataKey]) == beadID {
+		if rootSourceBeadID(store, root) == beadID {
 			continue // this bead's own prior/replacement root, not a collision
 		}
 		collidingIDs = append(collidingIDs, root.ID)

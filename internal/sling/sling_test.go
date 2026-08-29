@@ -2609,6 +2609,119 @@ func TestSlingAttachFormulaNoWarningWhenArtifactRootCollidesOnlyWithOwnRoot(t *t
 	}
 }
 
+// TestSlingAttachFormulaNoWarningWhenOwnRootIsConvoyFirst covers the actual
+// production bug found 2026-08-28: doStartGraphWorkflow's convoy-first
+// branch deliberately passes an empty sourceBeadID (see that call site's own
+// comment -- provenance is tracked through gc.input_convoy_id instead), so
+// the OLD exclusion check (bare gc.source_bead_id equality) could never
+// match a convoy-first root against the bead it was launched for. Every
+// single convoy-first `gc sling` dispatch (the common path) consequently
+// warned about colliding with the workflow root it had JUST created for
+// itself -- a 100% false-positive rate confirmed live. rootSourceBeadID must
+// resolve through the convoy's own "tracks" dependency back to the source
+// bead so this same-bead case is correctly recognized as no collision.
+func TestSlingAttachFormulaNoWarningWhenOwnRootIsConvoyFirst(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task"})
+	convoy, err := deps.Store.Create(beads.Bead{
+		Title:    "input convoy for " + b.ID,
+		Type:     "convoy",
+		Metadata: map[string]string{"gc.synthetic": "true"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deps.Store.DepAdd(convoy.ID, b.ID, "tracks"); err != nil {
+		t.Fatalf("store.DepAdd(tracks): %v", err)
+	}
+	if _, err := deps.Store.Create(beads.Bead{
+		Title:  "this bead's own convoy-first root",
+		Type:   "task",
+		Status: "in_progress",
+		Metadata: map[string]string{
+			"gc.kind":              "workflow",
+			"gc.input_convoy_id":   convoy.ID,
+			"gc.var.artifact_root": "/tmp/convoy-first-path",
+			// Deliberately NO gc.source_bead_id -- matches doStartGraphWorkflow's
+			// real convoy-first behavior exactly.
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	result, err := s.AttachFormula(context.Background(), "code-review", b.ID, a, FormulaOpts{Vars: []string{"artifact_root=/tmp/convoy-first-path"}})
+	if err != nil {
+		t.Fatalf("AttachFormula: %v", err)
+	}
+	for _, w := range result.BeadWarnings {
+		if strings.Contains(w, "already in use by other LIVE workflow root") {
+			t.Errorf("BeadWarnings = %#v, want no collision hint when the only match is this same bead's own convoy-first root", result.BeadWarnings)
+		}
+	}
+}
+
+// TestSlingAttachFormulaWarnsOnConvoyFirstCrossBeadCollision guards the
+// inverse of the above: a convoy-first root that tracks a DIFFERENT bead
+// than the one being dispatched is a genuine collision and must still warn
+// -- rootSourceBeadID's convoy fallback must not blanket-suppress real
+// cross-bead collisions just because both roots happen to be convoy-first.
+func TestSlingAttachFormulaWarnsOnConvoyFirstCrossBeadCollision(t *testing.T) {
+	runner := newFakeRunner()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test"}}
+	deps := testDeps(cfg, runtime.NewFake(), runner.run)
+	otherSource, _ := deps.Store.Create(beads.Bead{Title: "other bug", Type: "task"})
+	otherConvoy, err := deps.Store.Create(beads.Bead{
+		Title:    "input convoy for " + otherSource.ID,
+		Type:     "convoy",
+		Metadata: map[string]string{"gc.synthetic": "true"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := deps.Store.DepAdd(otherConvoy.ID, otherSource.ID, "tracks"); err != nil {
+		t.Fatalf("store.DepAdd(tracks): %v", err)
+	}
+	if _, err := deps.Store.Create(beads.Bead{
+		Title:  "other bead's convoy-first root",
+		Type:   "task",
+		Status: "in_progress",
+		Metadata: map[string]string{
+			"gc.kind":              "workflow",
+			"gc.input_convoy_id":   otherConvoy.ID,
+			"gc.var.artifact_root": "/tmp/shared-convoy-path",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := deps.Store.Create(beads.Bead{Title: "work", Type: "task"})
+
+	s, err := New(deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
+	result, err := s.AttachFormula(context.Background(), "code-review", b.ID, a, FormulaOpts{Vars: []string{"artifact_root=/tmp/shared-convoy-path"}})
+	if err != nil {
+		t.Fatalf("AttachFormula: %v", err)
+	}
+	found := false
+	for _, w := range result.BeadWarnings {
+		if strings.Contains(w, "already in use by other LIVE workflow root") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("BeadWarnings = %#v, want a collision hint for a genuine cross-bead convoy-first collision", result.BeadWarnings)
+	}
+}
+
 // TestSlingAttachFormulaWarnsWhenBuildBasicOverwritesDescription covers
 // gc-4mf7ze: dispatching formula=build-basic (which brainstorms fresh
 // requirements from scratch) against a bead that already has a description
