@@ -24211,6 +24211,17 @@
               "null"
             ]
           },
+          "series": {
+            "description": "Hourly closure counts across the window (same exclusions as Closed), oldest hour first; length equals window_hours.",
+            "items": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "wisps_closed": {
             "description": "Wisp-tier (ephemeral/no-history) closures in the window, reported separately from Closed.",
             "format": "int64",
@@ -24416,6 +24427,17 @@
             "description": "Stores or reads that were skipped.",
             "items": {
               "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "series": {
+            "description": "Hourly completion counts across the window, oldest hour first; length equals window_hours.",
+            "items": {
+              "format": "int64",
+              "type": "integer"
             },
             "type": [
               "array",

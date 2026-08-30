@@ -3214,6 +3214,7 @@ export const zVelocityBeads = z.object({
     closed: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
     partial: z.boolean().optional(),
     partial_reasons: z.array(z.string()).nullish(),
+    series: z.array(z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' })).nullish(),
     wisps_closed: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' })
 });
 
@@ -3237,7 +3238,8 @@ export const zVelocityRuns = z.object({
     by_formula: z.array(zVelocityFormulaRuns).nullish(),
     completed: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
     partial: z.boolean().optional(),
-    partial_reasons: z.array(z.string()).nullish()
+    partial_reasons: z.array(z.string()).nullish(),
+    series: z.array(z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' })).nullish()
 });
 
 export const zVelocityBody = z.object({

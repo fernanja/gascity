@@ -9149,6 +9149,10 @@ export type VelocityBeads = {
      */
     partial_reasons?: Array<string> | null;
     /**
+     * Hourly closure counts across the window (same exclusions as Closed), oldest hour first; length equals window_hours.
+     */
+    series?: Array<number> | null;
+    /**
      * Wisp-tier (ephemeral/no-history) closures in the window, reported separately from Closed.
      */
     wisps_closed: number;
@@ -9278,6 +9282,10 @@ export type VelocityRuns = {
      * Stores or reads that were skipped.
      */
     partial_reasons?: Array<string> | null;
+    /**
+     * Hourly completion counts across the window, oldest hour first; length equals window_hours.
+     */
+    series?: Array<number> | null;
 };
 
 export type WaitListBody = {

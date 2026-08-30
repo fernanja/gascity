@@ -21,6 +21,7 @@ import {
   RunRings,
   StatTile,
   StatusLamps,
+  TrendLine,
   type BarListItem,
   type LampState,
 } from '../components/cockpit/Instruments';
@@ -492,6 +493,25 @@ export function CockpitHomePage() {
             value={velocity !== undefined ? formatCount(velocity.beads.closed) : null}
           />
         </div>
+        {velocity !== undefined &&
+          (velocity.runs.series ?? []).length > 0 &&
+          (velocity.beads.series ?? []).length > 0 && (
+            <div
+              className="mt-6 grid gap-x-10 gap-y-6 lg:grid-cols-2"
+              data-testid="velocity-trends"
+            >
+              <TrendLine
+                label="runs completed"
+                samples={velocity.runs.series ?? []}
+                caption="per hour · 72h"
+              />
+              <TrendLine
+                label="beads closed"
+                samples={velocity.beads.series ?? []}
+                caption="per hour · 72h"
+              />
+            </div>
+          )}
         {velocity !== undefined && (
           <div className="mt-6 grid gap-x-10 gap-y-6 lg:grid-cols-2" data-testid="velocity-charts">
             <div>

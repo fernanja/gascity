@@ -45,6 +45,7 @@ type VelocityFormulaRuns struct {
 type VelocityRuns struct {
 	Completed      int                   `json:"completed" doc:"Workflow roots closed in the window across all stores."`
 	ByFormula      []VelocityFormulaRuns `json:"by_formula,omitempty" doc:"Per-formula breakdown, largest first, capped with an 'other' rollup."`
+	Series         []int                 `json:"series,omitempty" doc:"Hourly completion counts across the window, oldest hour first; length equals window_hours."`
 	Partial        bool                  `json:"partial,omitempty" doc:"True when at least one bead store could not be read."`
 	PartialReasons []string              `json:"partial_reasons,omitempty" doc:"Stores or reads that were skipped."`
 }
@@ -54,6 +55,7 @@ type VelocityBeads struct {
 	Closed         int                  `json:"closed" doc:"Beads closed in the window across all stores (sessions and wisps excluded)."`
 	ByType         []VelocityGroupCount `json:"by_type,omitempty" doc:"Completions grouped by issue type."`
 	ByKind         []VelocityGroupCount `json:"by_kind,omitempty" doc:"Completions grouped by gc.kind; beads with no kind report as '(work)'."`
+	Series         []int                `json:"series,omitempty" doc:"Hourly closure counts across the window (same exclusions as Closed), oldest hour first; length equals window_hours."`
 	WispsClosed    int                  `json:"wisps_closed" doc:"Wisp-tier (ephemeral/no-history) closures in the window, reported separately from Closed."`
 	Partial        bool                 `json:"partial,omitempty" doc:"True when at least one bead store could not be read."`
 	PartialReasons []string             `json:"partial_reasons,omitempty" doc:"Stores or reads that were skipped."`

@@ -116,3 +116,21 @@ export function laneToRing(lane: RunLane): RunRingModel {
     href: runDetailHref(lane.id, lane.scope),
   };
 }
+
+/**
+ * Build an SVG polyline `points` string for a sparkline over a 100×32
+ * viewBox: x spans the full width, y maps the series onto [4, 28] with the
+ * list-wide max at the top. A single sample renders as a point at x=0.
+ * Shared by ActivityTrace and TrendLine so their line geometry cannot drift.
+ */
+export function sparklinePoints(values: readonly number[]): string {
+  const series = values.length > 0 ? values : [0];
+  const max = Math.max(1, ...series);
+  return series
+    .map((value, index) => {
+      const x = series.length === 1 ? 0 : (index / (series.length - 1)) * 100;
+      const y = 28 - (Math.max(0, value) / max) * 24;
+      return `${x},${y}`;
+    })
+    .join(' ');
+}

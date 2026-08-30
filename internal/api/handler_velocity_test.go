@@ -59,10 +59,30 @@ func TestBuildVelocityLocalAggregatesRunsAndBeads(t *testing.T) {
 	s := newServer(state, false)
 
 	since := time.Now().UTC().Add(-72 * time.Hour)
-	runs, beadsAgg := s.buildVelocityLocal(since)
+	runs, beadsAgg := s.buildVelocityLocal(since, 72)
 
 	if runs.Completed != 2 {
 		t.Fatalf("runs.Completed = %d, want 2", runs.Completed)
+	}
+	if len(runs.Series) != 72 || len(beadsAgg.Series) != 72 {
+		t.Fatalf("series lengths = %d/%d, want 72/72", len(runs.Series), len(beadsAgg.Series))
+	}
+	// run-pass closed ~1h ago and run-fail ~2h ago land in the last few hour
+	// buckets (exact index shifts by sub-second truncation of `since`).
+	occupied := make([]int, 0, 2)
+	for i, count := range runs.Series {
+		for j := 0; j < count; j++ {
+			occupied = append(occupied, i)
+		}
+	}
+	if len(occupied) != 2 || occupied[0] < 68 || occupied[1] < 68 {
+		t.Fatalf("runs.Series occupied buckets = %v, want two buckets near the window's end", occupied)
+	}
+	if sumInts(runs.Series) != runs.Completed {
+		t.Fatalf("runs.Series sum = %d, want Completed %d", sumInts(runs.Series), runs.Completed)
+	}
+	if sumInts(beadsAgg.Series) != beadsAgg.Closed {
+		t.Fatalf("beads.Series sum = %d, want Closed %d", sumInts(beadsAgg.Series), beadsAgg.Closed)
 	}
 	if len(runs.ByFormula) != 2 {
 		t.Fatalf("runs.ByFormula = %+v, want 2 formulas", runs.ByFormula)
@@ -118,7 +138,7 @@ func TestBuildVelocityLocalDegradesToPartialOnStoreFailure(t *testing.T) {
 	}
 	s := newServer(state, false)
 
-	runs, beadsAgg := s.buildVelocityLocal(time.Now().UTC().Add(-72 * time.Hour))
+	runs, beadsAgg := s.buildVelocityLocal(time.Now().UTC().Add(-72*time.Hour), 72)
 	if !runs.Partial || !beadsAgg.Partial {
 		t.Fatalf("partial = %v/%v, want true", runs.Partial, beadsAgg.Partial)
 	}
@@ -311,6 +331,14 @@ func TestVelocityPRsSurvivesCanceledRequestContext(t *testing.T) {
 	if !prs.Available || prs.Merged != 3 {
 		t.Fatalf("prs = %+v, want available reading despite canceled parent context", prs)
 	}
+}
+
+func sumInts(values []int) int {
+	total := 0
+	for _, v := range values {
+		total += v
+	}
+	return total
 }
 
 func TestCappedGroupCountsRollsUpBeyondCap(t *testing.T) {

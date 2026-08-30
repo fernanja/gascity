@@ -4,6 +4,7 @@ import { MemoryRouter } from 'react-router-dom';
 import {
   ActivityTrace,
   BarList,
+  TrendLine,
   Gauge,
   Odometer,
   PipelineBar,
@@ -197,5 +198,21 @@ describe('bar list', () => {
   it('shows the empty label when there is nothing to chart', () => {
     render(<BarList items={[]} emptyLabel="no runs completed in this window" />);
     expect(screen.getByText('no runs completed in this window')).toBeTruthy();
+  });
+});
+
+describe('trend line', () => {
+  afterEach(() => cleanup());
+
+  it('exposes the series total in the accessibility tree', () => {
+    render(<TrendLine label="runs completed" samples={[1, 0, 3]} caption="per hour · 72h" />);
+    expect(screen.getByRole('figure', { name: 'runs completed: 4 over the window' })).toBeTruthy();
+    expect(screen.getByText('per hour · 72h')).toBeTruthy();
+  });
+
+  it('renders a polyline spanning the series', () => {
+    const { container } = render(<TrendLine label="beads closed" samples={[2, 2]} />);
+    const polyline = container.querySelector('polyline');
+    expect(polyline?.getAttribute('points')).toBe('0,4 100,4');
   });
 });

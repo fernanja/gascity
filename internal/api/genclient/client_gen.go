@@ -8494,6 +8494,9 @@ type VelocityBeads struct {
 	// PartialReasons Stores or reads that were skipped.
 	PartialReasons *[]string `json:"partial_reasons,omitempty"`
 
+	// Series Hourly closure counts across the window (same exclusions as Closed), oldest hour first; length equals window_hours.
+	Series *[]int64 `json:"series,omitempty"`
+
 	// WispsClosed Wisp-tier (ephemeral/no-history) closures in the window, reported separately from Closed.
 	WispsClosed int64 `json:"wisps_closed"`
 }
@@ -8590,6 +8593,9 @@ type VelocityRuns struct {
 
 	// PartialReasons Stores or reads that were skipped.
 	PartialReasons *[]string `json:"partial_reasons,omitempty"`
+
+	// Series Hourly completion counts across the window, oldest hour first; length equals window_hours.
+	Series *[]int64 `json:"series,omitempty"`
 }
 
 // WaitListBody defines model for WaitListBody.

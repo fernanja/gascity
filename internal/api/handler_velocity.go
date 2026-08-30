@@ -95,7 +95,7 @@ func (s *Server) rebuildVelocityLocal(windowHours int) VelocityBody {
 		Since:       since.Format(time.RFC3339),
 		GeneratedAt: now.Format(time.RFC3339Nano),
 	}
-	body.Runs, body.Beads = s.buildVelocityLocal(since)
+	body.Runs, body.Beads = s.buildVelocityLocal(since, windowHours)
 	s.storeResponse(fmt.Sprintf("velocity:local:%d", windowHours), 0, body)
 	s.storeResponse(velocityLocalLastGoodKey(windowHours), 0, body)
 	return body
@@ -117,9 +117,9 @@ func (s *Server) kickVelocityLocalRebuild(windowHours int) {
 // buildVelocityLocal aggregates closed workflow roots and closed beads across
 // every workflow store. Store failures degrade to partial results, never to a
 // failed response (the orders_feed idiom).
-func (s *Server) buildVelocityLocal(since time.Time) (VelocityRuns, VelocityBeads) {
-	runs := VelocityRuns{}
-	beadsAgg := VelocityBeads{}
+func (s *Server) buildVelocityLocal(since time.Time, windowHours int) (VelocityRuns, VelocityBeads) {
+	runs := VelocityRuns{Series: make([]int, windowHours)}
+	beadsAgg := VelocityBeads{Series: make([]int, windowHours)}
 	formulaCounts := make(map[string]*VelocityFormulaRuns)
 	typeCounts := make(map[string]int)
 	kindCounts := make(map[string]int)
@@ -145,8 +145,10 @@ func (s *Server) buildVelocityLocal(since time.Time) (VelocityRuns, VelocityBead
 			continue
 		}
 		for _, bead := range closed {
+			bucket := velocityBucketIndex(velocityCloseTime(bead), since, windowHours)
 			if isWorkflowRoot(bead) {
 				runs.Completed++
+				runs.Series[bucket]++
 				name := workflowFormulaName(bead)
 				entry := formulaCounts[name]
 				if entry == nil {
@@ -168,6 +170,7 @@ func (s *Server) buildVelocityLocal(since time.Time) (VelocityRuns, VelocityBead
 				continue
 			}
 			beadsAgg.Closed++
+			beadsAgg.Series[bucket]++
 			beadType := strings.TrimSpace(bead.Type)
 			if beadType == "" {
 				beadType = "task"
@@ -203,6 +206,33 @@ func (s *Server) buildVelocityLocal(since time.Time) (VelocityRuns, VelocityBead
 	beadsAgg.ByType = cappedGroupCounts(typeCounts)
 	beadsAgg.ByKind = cappedGroupCounts(kindCounts)
 	return runs, beadsAgg
+}
+
+// velocityCloseTime mirrors the beads layer's close-time reference: the
+// recorded ClosedAt when present, else UpdatedAt (a close bumps it), else
+// CreatedAt.
+func velocityCloseTime(bead beads.Bead) time.Time {
+	if bead.ClosedAt != nil && !bead.ClosedAt.IsZero() {
+		return *bead.ClosedAt
+	}
+	if !bead.UpdatedAt.IsZero() {
+		return bead.UpdatedAt
+	}
+	return bead.CreatedAt
+}
+
+// velocityBucketIndex maps a close time to its hour bucket in [0, windowHours),
+// oldest hour first. Out-of-range values clamp to the nearest edge so clock
+// skew can never panic the aggregation.
+func velocityBucketIndex(closed, since time.Time, windowHours int) int {
+	index := int(closed.Sub(since) / time.Hour)
+	if index < 0 {
+		return 0
+	}
+	if index >= windowHours {
+		return windowHours - 1
+	}
+	return index
 }
 
 func cappedFormulaRuns(counts map[string]*VelocityFormulaRuns) []VelocityFormulaRuns {

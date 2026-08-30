@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import { pipelineWidths, type PipelineSegment, type RunRingModel } from './model';
+import { pipelineWidths, sparklinePoints, type PipelineSegment, type RunRingModel } from './model';
 
 export function InstrumentNote({ children }: { children: ReactNode }) {
   return <p className="mt-1 text-label italic text-fg-faint">{children}</p>;
@@ -53,6 +53,58 @@ export function StatTile({
       <div className="mt-1 text-label uppercase tracking-wider text-fg-faint">{label}</div>
       {note && <InstrumentNote>{note}</InstrumentNote>}
     </div>
+  );
+}
+
+/**
+ * A labelled sparkline over a fixed series — the ActivityTrace line geometry
+ * without its sample-accumulation framing. Used for server-supplied time
+ * series (e.g. the velocity section's hourly completion counts).
+ */
+export function TrendLine({
+  label,
+  samples,
+  caption,
+  note,
+}: {
+  label: string;
+  samples: readonly number[];
+  /** Right-aligned annotation, e.g. "per hour · 72h". */
+  caption?: string | undefined;
+  note?: string | undefined;
+}) {
+  const total = samples.reduce((sum, value) => sum + Math.max(0, value), 0);
+  const points = sparklinePoints(samples);
+  return (
+    <figure
+      className="m-0"
+      aria-label={`${label}: ${total} over the window${note ? `; ${note}` : ''}`}
+      data-testid="trend-line"
+    >
+      <div className="mb-2 flex items-baseline justify-between gap-4">
+        <figcaption className="text-label uppercase tracking-wider text-fg-faint">
+          {label}
+        </figcaption>
+        {caption && <span className="text-label text-fg-muted tnum">{caption}</span>}
+      </div>
+      <svg
+        viewBox="0 0 100 32"
+        preserveAspectRatio="none"
+        className="h-16 w-full border-y border-rule"
+        aria-hidden
+      >
+        <line x1="0" y1="28" x2="100" y2="28" className="stroke-rule" strokeWidth="0.4" />
+        <polyline
+          points={points}
+          fill="none"
+          className="stroke-fg"
+          strokeWidth="1.2"
+          vectorEffect="non-scaling-stroke"
+          strokeLinejoin="round"
+        />
+      </svg>
+      {note && <InstrumentNote>{note}</InstrumentNote>}
+    </figure>
   );
 }
 
@@ -194,14 +246,7 @@ export function ActivityTrace({
   note?: string | undefined;
 }) {
   const values = samples.length > 0 ? samples : [0];
-  const max = Math.max(1, ...values);
-  const points = values
-    .map((value, index) => {
-      const x = values.length === 1 ? 0 : (index / (values.length - 1)) * 100;
-      const y = 28 - (Math.max(0, value) / max) * 24;
-      return `${x},${y}`;
-    })
-    .join(' ');
+  const points = sparklinePoints(values);
   const last = values.at(-1) ?? 0;
   const readingLabel = available
     ? `recent model activity: ${last} invocation${last === 1 ? '' : 's'} in the current window`
