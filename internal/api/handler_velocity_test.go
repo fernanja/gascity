@@ -230,6 +230,89 @@ func TestVelocityPRsUnavailableOnTokenFailureWithoutLastGood(t *testing.T) {
 	}
 }
 
+func TestVelocityServesRetainedAggregateWhileRebuilding(t *testing.T) {
+	state := newFakeState(t)
+	state.stores = map[string]beads.Store{
+		"myrig": beads.NewMemStoreFrom(2, []beads.Bead{velocityTestBead("ok-1", time.Hour, "task", nil)}, nil),
+	}
+	s := newServer(state, false)
+
+	// Prime both cache lanes, then expire the fresh one.
+	first := s.rebuildVelocityLocal(72)
+	if first.Beads.Closed != 1 {
+		t.Fatalf("primed aggregate Closed = %d, want 1", first.Beads.Closed)
+	}
+	s.responseCacheMu.Lock()
+	delete(s.responseCacheEntries, "velocity:local:72")
+	s.responseCacheMu.Unlock()
+
+	// Run the "async" rebuild inline and count launches.
+	launches := 0
+	oldLaunch := velocityRebuildLaunch
+	velocityRebuildLaunch = func(rebuild func()) {
+		launches++
+		rebuild()
+	}
+	t.Cleanup(func() { velocityRebuildLaunch = oldLaunch })
+
+	out, err := s.humaHandleVelocity(context.Background(), &VelocityInput{WindowHours: 72})
+	if err != nil {
+		t.Fatalf("humaHandleVelocity: %v", err)
+	}
+	// The retained aggregate served (no inline scan), and one rebuild ran.
+	if out.Body.Beads.Closed != 1 {
+		t.Fatalf("served Closed = %d, want retained 1", out.Body.Beads.Closed)
+	}
+	if launches != 1 {
+		t.Fatalf("rebuild launches = %d, want 1", launches)
+	}
+	// The rebuild restored the fresh lane: the next call is a plain cache hit.
+	if _, ok := cachedResponseWithinAgeAs[VelocityBody](s, "velocity:local:72", velocityLocalCacheMaxAge); !ok {
+		t.Fatal("fresh cache lane not repopulated by the rebuild")
+	}
+}
+
+func TestKickVelocityLocalRebuildCoalescesConcurrentPolls(t *testing.T) {
+	state := newFakeState(t)
+	s := newServer(state, false)
+
+	launched := make([]func(), 0, 2)
+	oldLaunch := velocityRebuildLaunch
+	velocityRebuildLaunch = func(rebuild func()) { launched = append(launched, rebuild) }
+	t.Cleanup(func() { velocityRebuildLaunch = oldLaunch })
+
+	s.kickVelocityLocalRebuild(72)
+	s.kickVelocityLocalRebuild(72) // second poll while the first is in flight
+	if len(launched) != 1 {
+		t.Fatalf("launched %d rebuilds, want 1 (coalesced)", len(launched))
+	}
+	launched[0]() // completes and clears the in-flight marker
+	s.kickVelocityLocalRebuild(72)
+	if len(launched) != 2 {
+		t.Fatalf("launched %d rebuilds after completion, want 2", len(launched))
+	}
+}
+
+func TestVelocityPRsSurvivesCanceledRequestContext(t *testing.T) {
+	state := newFakeState(t)
+	state.cfg.Dashboard.Velocity.GitHubRepos = []string{"acme/app"}
+	s := newServer(state, false)
+	now := time.Now().UTC()
+
+	withVelocityGitHubStubs(t, &stubPRCounter{counts: map[string]githubmonitor.PRCounts{
+		"acme/app": {Merged: 3, Created: 4},
+	}}, nil)
+
+	// A browser abort cancels the request context mid-flight; the GitHub
+	// fetch must still complete and prime the cache.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	prs := s.velocityPRs(ctx, 72, now.Add(-72*time.Hour), now)
+	if !prs.Available || prs.Merged != 3 {
+		t.Fatalf("prs = %+v, want available reading despite canceled parent context", prs)
+	}
+}
+
 func TestCappedGroupCountsRollsUpBeyondCap(t *testing.T) {
 	counts := map[string]int{}
 	for i := 0; i < velocityGroupCap+3; i++ {

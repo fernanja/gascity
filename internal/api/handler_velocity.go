@@ -25,7 +25,10 @@ const (
 	// velocityGitHubLastGoodMaxAge bounds how long a failed refresh may keep
 	// serving the retained last-good GitHub reading (marked Stale).
 	velocityGitHubLastGoodMaxAge = 24 * time.Hour
-	velocityGitHubFetchTimeout   = 15 * time.Second
+	// velocityLocalLastGoodMaxAge bounds how long an expired local aggregate
+	// may serve while a background rebuild replaces it.
+	velocityLocalLastGoodMaxAge = 24 * time.Hour
+	velocityGitHubFetchTimeout  = 15 * time.Second
 	// velocityGroupCap caps every group list; the remainder rolls up into an
 	// "other" row so pathological group cardinality cannot bloat the wire.
 	velocityGroupCap = 12
@@ -43,6 +46,9 @@ var (
 		return githubmonitor.NewGraphQLClient(token)
 	}
 	resolveVelocityGitHubToken = githubmonitor.ResolveToken
+	// velocityRebuildLaunch runs the async local-aggregate rebuild. A seam so
+	// tests can run it inline instead of racing a goroutine.
+	velocityRebuildLaunch = func(rebuild func()) { go rebuild() }
 )
 
 func (s *Server) humaHandleVelocity(ctx context.Context, input *VelocityInput) (*VelocityOutput, error) {
@@ -59,16 +65,53 @@ func (s *Server) humaHandleVelocity(ctx context.Context, input *VelocityInput) (
 	localKey := fmt.Sprintf("velocity:local:%d", windowHours)
 	body, ok := cachedResponseWithinAgeAs[VelocityBody](s, localKey, velocityLocalCacheMaxAge)
 	if !ok {
-		body = VelocityBody{
-			WindowHours: windowHours,
-			Since:       since.Format(time.RFC3339),
-			GeneratedAt: now.Format(time.RFC3339Nano),
+		// The full multi-store closed-bead scan takes ~10s on a busy city.
+		// Blocking a dashboard poll on it every cache expiry makes the tile
+		// flap, so an expired-but-retained aggregate serves immediately while
+		// one background rebuild refreshes the cache. Only a cold start (no
+		// retained aggregate at all) pays the scan inline.
+		if retained, okRetained := cachedResponseWithinAgeAs[VelocityBody](s, velocityLocalLastGoodKey(windowHours), velocityLocalLastGoodMaxAge); okRetained {
+			body = retained
+			s.kickVelocityLocalRebuild(windowHours)
+		} else {
+			body = s.rebuildVelocityLocal(windowHours)
 		}
-		body.Runs, body.Beads = s.buildVelocityLocal(since)
-		s.storeResponse(localKey, 0, body)
 	}
 	body.PRs = s.velocityPRs(ctx, windowHours, since, now)
 	return &VelocityOutput{Body: body}, nil
+}
+
+func velocityLocalLastGoodKey(windowHours int) string {
+	return fmt.Sprintf("velocity:local-lastgood:%d", windowHours)
+}
+
+// rebuildVelocityLocal computes the local aggregate for the window and stores
+// it under both the fresh and last-good cache keys.
+func (s *Server) rebuildVelocityLocal(windowHours int) VelocityBody {
+	now := time.Now().UTC()
+	since := now.Add(-time.Duration(windowHours) * time.Hour)
+	body := VelocityBody{
+		WindowHours: windowHours,
+		Since:       since.Format(time.RFC3339),
+		GeneratedAt: now.Format(time.RFC3339Nano),
+	}
+	body.Runs, body.Beads = s.buildVelocityLocal(since)
+	s.storeResponse(fmt.Sprintf("velocity:local:%d", windowHours), 0, body)
+	s.storeResponse(velocityLocalLastGoodKey(windowHours), 0, body)
+	return body
+}
+
+// kickVelocityLocalRebuild starts one background rebuild per window;
+// concurrent polls that find the same expired cache coalesce onto it.
+func (s *Server) kickVelocityLocalRebuild(windowHours int) {
+	key := fmt.Sprintf("velocity:rebuild:%d", windowHours)
+	if _, alreadyRunning := s.velocityRebuilds.LoadOrStore(key, struct{}{}); alreadyRunning {
+		return
+	}
+	velocityRebuildLaunch(func() {
+		defer s.velocityRebuilds.Delete(key)
+		s.rebuildVelocityLocal(windowHours)
+	})
 }
 
 // buildVelocityLocal aggregates closed workflow roots and closed beads across
@@ -238,7 +281,13 @@ func (s *Server) velocityPRs(ctx context.Context, windowHours int, since, now ti
 }
 
 func fetchVelocityPRs(ctx context.Context, repos []string, since time.Time) (VelocityPRs, error) {
-	fetchCtx, cancel := context.WithTimeout(ctx, velocityGitHubFetchTimeout)
+	// Detached from request cancellation: a browser that aborts a poll
+	// mid-flight (tab switch, superseding refresh) must not kill the
+	// `gh auth token` subprocess or the GraphQL calls — that failure mode
+	// kept the GitHub cache from ever priming under real dashboard load
+	// (observed 2026-08-29: "gh auth token failed: context canceled").
+	// The fetch's own timeout stays the bound.
+	fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), velocityGitHubFetchTimeout)
 	defer cancel()
 
 	token, err := resolveVelocityGitHubToken(fetchCtx)

@@ -96,6 +96,10 @@ type Server struct {
 	responseCacheMu      sync.Mutex
 	responseCacheEntries map[string]responseCacheEntry
 
+	// velocityRebuilds coalesces concurrent background rebuilds of the
+	// /velocity local aggregate: one in-flight rebuild per window.
+	velocityRebuilds sync.Map
+
 	// storeHealth caches the on-disk size walk and maintenance-log read
 	// for /v0/status's StoreHealth block. Refreshed on expiry; missing
 	// store directories produce a zero-value entry so repeated requests
