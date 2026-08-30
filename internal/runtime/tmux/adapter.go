@@ -329,10 +329,41 @@ func (p *Provider) ProcessAlive(name string, processNames []string) bool {
 	return p.cache.ProcessAlive(name, processNames)
 }
 
+// findRuntimesListRetries and findRuntimesListRetryInterval bound how long
+// FindRuntimesBySessionID rides out a transient tmux-list failure before
+// falling back to the fail-closed path below (gc-sbcakf). The "no tmux server
+// running" blips this targets are chronic but short-lived — most clear within
+// a few hundred milliseconds — so most orphan-scans never reach fail-closed at
+// all, and a genuinely dead server still falls through after this bounded
+// wait, unchanged from before.
+const (
+	findRuntimesListRetries       = 4
+	findRuntimesListRetryInterval = 150 * time.Millisecond
+)
+
+// listRunningWithRetry retries ListRunning while it keeps returning a
+// [runtime.PartialListError] (the transient/degraded case), up to
+// findRuntimesListRetries attempts. Any other error — including success —
+// returns immediately with no added latency.
+func (p *Provider) listRunningWithRetry(prefix string) ([]string, error) {
+	var running []string
+	var err error
+	for attempt := 0; attempt < findRuntimesListRetries; attempt++ {
+		running, err = p.ListRunning(prefix)
+		if err == nil || !runtime.IsPartialListError(err) {
+			return running, err
+		}
+		if attempt < findRuntimesListRetries-1 {
+			time.Sleep(findRuntimesListRetryInterval)
+		}
+	}
+	return running, err
+}
+
 // FindRuntimesBySessionID implements [runtime.ProcessTableScanner].
 func (p *Provider) FindRuntimesBySessionID(id string) ([]runtime.LiveRuntime, error) {
 	found, scanErr := proctable.ScanBySessionID(id)
-	running, listErr := p.ListRunning("")
+	running, listErr := p.listRunningWithRetry("")
 	if listErr != nil {
 		// Fail CLOSED: without the live-session list we cannot prove which
 		// scanned roots are gc-tracked. Marking them all tracked (the previous
@@ -346,18 +377,22 @@ func (p *Provider) FindRuntimesBySessionID(id string) ([]runtime.LiveRuntime, er
 		// tmux-list hiccup rather than a truly-gone server, a still-live
 		// session's root can land here untracked and be targeted for kill —
 		// the same tmux machinery backs ensureRunning's !IsRunning gate, so a
-		// blip flips both. We accept this over the alternative (a survivor
-		// racing the replacement for the same work bead, causing duplicate bd
-		// closes), because the survivor bug is silent and corrupts work state
-		// while a wrongful kill is loud and self-heals on the next reconcile.
-		// Two mitigations bound the blast radius: (1) KillByPID confirms death
-		// by PID + /proc start-time identity (pidutil.AliveWithStartTime), so a
-		// genuinely-live root is never misreported as dead — if it resists the
-		// kill it surfaces a real "not confirmed dead" error; and (2) that
-		// error propagates through killExistingOrphans to every gated Start,
-		// which then refuses rather than racing. Independently re-deriving
-		// "is this the current live session" here would require the very
-		// ListRunning that just failed, so it is intentionally not attempted.
+		// blip flips both. listRunningWithRetry above already rides out the
+		// common short-lived case (gc-sbcakf), so reaching this branch means
+		// the failure survived several hundred milliseconds of retry, not just
+		// one unlucky call. We accept the residual risk over the alternative (a
+		// survivor racing the replacement for the same work bead, causing
+		// duplicate bd closes), because the survivor bug is silent and corrupts
+		// work state while a wrongful kill is loud and self-heals on the next
+		// reconcile. Two mitigations further bound the blast radius: (1)
+		// KillByPID confirms death by PID + /proc start-time identity
+		// (pidutil.AliveWithStartTime), so a genuinely-live root is never
+		// misreported as dead — if it resists the kill it surfaces a real "not
+		// confirmed dead" error; and (2) that error propagates through
+		// killExistingOrphans to every gated Start, which then refuses rather
+		// than racing. Independently re-deriving "is this the current live
+		// session" here would require the very ListRunning that just failed
+		// (repeatedly), so it is intentionally not attempted.
 		return found, errors.Join(scanErr, fmt.Errorf("tmux list running: %w", listErr))
 	}
 

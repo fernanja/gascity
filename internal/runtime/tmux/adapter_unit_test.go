@@ -131,6 +131,68 @@ func TestProviderListRunningPropagatesNonServerError(t *testing.T) {
 	}
 }
 
+// TestListRunningWithRetrySucceedsAfterTransientFailures pins the gc-sbcakf
+// fix: a tmux-unreachable blip that clears within a couple of attempts must
+// not reach FindRuntimesBySessionID's fail-closed path at all.
+func TestListRunningWithRetrySucceedsAfterTransientFailures(t *testing.T) {
+	fe := &fakeExecutor{errs: []error{ErrNoServer, ErrNoServer, nil}}
+	p := NewProviderWithConfig(Config{SocketName: "x"})
+	p.tm.exec = fe
+
+	names, err := p.listRunningWithRetry("")
+	if err != nil {
+		t.Fatalf("listRunningWithRetry err = %v, want nil once the blip clears", err)
+	}
+	if names != nil {
+		t.Fatalf("listRunningWithRetry names = %v, want nil (empty session list)", names)
+	}
+	if len(fe.calls) != 3 {
+		t.Fatalf("listRunningWithRetry made %d tmux calls, want exactly 3 (stop retrying once it succeeds)", len(fe.calls))
+	}
+}
+
+// TestListRunningWithRetryFallsBackAfterExhaustingAttempts pins the other
+// half of the trade-off: a genuinely dead tmux server must still end up
+// fail-closed, just after riding out findRuntimesListRetries attempts first.
+func TestListRunningWithRetryFallsBackAfterExhaustingAttempts(t *testing.T) {
+	fe := &fakeExecutor{err: ErrNoServer}
+	p := NewProviderWithConfig(Config{SocketName: "x"})
+	p.tm.exec = fe
+
+	names, err := p.listRunningWithRetry("")
+	if names != nil {
+		t.Fatalf("listRunningWithRetry names = %v, want nil on exhausted retries", names)
+	}
+	if !runtime.IsPartialListError(err) {
+		t.Fatalf("listRunningWithRetry err = %v, want runtime.PartialListError preserved after exhausting retries", err)
+	}
+	if !errors.Is(err, ErrNoServer) {
+		t.Fatalf("listRunningWithRetry err = %v, want wrapped ErrNoServer cause", err)
+	}
+	if len(fe.calls) != findRuntimesListRetries {
+		t.Fatalf("listRunningWithRetry made %d tmux calls, want exactly findRuntimesListRetries=%d", len(fe.calls), findRuntimesListRetries)
+	}
+}
+
+// TestListRunningWithRetryDoesNotRetryNonTransientError confirms the retry is
+// scoped to the documented transient (PartialListError) case only — a real,
+// non-transient tmux error must fail on the first attempt, unchanged from
+// before this fix.
+func TestListRunningWithRetryDoesNotRetryNonTransientError(t *testing.T) {
+	sentinel := errors.New("tmux exploded")
+	fe := &fakeExecutor{err: sentinel}
+	p := NewProviderWithConfig(Config{SocketName: "x"})
+	p.tm.exec = fe
+
+	_, err := p.listRunningWithRetry("")
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("listRunningWithRetry err = %v, want the underlying tmux error", err)
+	}
+	if len(fe.calls) != 1 {
+		t.Fatalf("listRunningWithRetry made %d tmux calls, want exactly 1 (no retry for a non-transient error)", len(fe.calls))
+	}
+}
+
 // TestListSessionsAbsorbsNoServer pins the tmux-internal contract that the
 // change deliberately preserves: ListSessions still reports an unreachable
 // server as an empty result so FindSessionByWorkDir and CleanupOrphanedSessions
