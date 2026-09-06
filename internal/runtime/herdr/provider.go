@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/execgrace"
+	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/runtime/proctable"
 	"github.com/gastownhall/gascity/internal/shellquote"
@@ -402,7 +403,11 @@ func (p *Provider) runSetupCommand(ctx context.Context, cmd string, env map[stri
 			c.Dir = p.c.cityRoot
 		}
 	}
-	c.Env = os.Environ()
+	// Strip leaked GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE (and related)
+	// variables — see tmux's runSetupCommand (adapter.go) for the full
+	// rationale (gc-qi40jt). Same gap, same fix, mirrored per this package's
+	// own convention of duplicating tmux's runSetupCommand semantics.
+	c.Env = git.SanitizedEnv()
 	for k, v := range env {
 		c.Env = append(c.Env, k+"="+v)
 	}

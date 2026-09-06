@@ -38,6 +38,7 @@ skill-dangling-sink
 order-firing-current
 codex-hooks-drift
 rig-pack-coverage
+control-gate-scripts
 pack-runtimes
 mcp-config
 mcp-shared-target

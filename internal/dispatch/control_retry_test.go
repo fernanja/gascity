@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -125,6 +127,41 @@ func TestClassifyControllerErrorTiers(t *testing.T) {
 		{name: "dolt server unreachable", err: errors.New("begin read tx: dolt server unreachable"), want: TierAvailability},
 		{name: "workflow root close blocked", err: closeBlockedErr("gsp-p68ch6", "gsp-yl7fpr"), want: TierSemantic},
 		{name: "scope body close blocked", err: closeBlockedErr("pl-pujtf", "pl-mmneh"), want: TierSemantic},
+		// gastownhall/gascity gc-3gimnj: a ralph check's gate script/directory
+		// not yet provisioned (e.g. a rig's .gc/scripts/checks/ missing) is
+		// plausibly transient rig-provisioning state, not a permanent
+		// misconfiguration -- it must get a bounded retry budget instead of
+		// quarantining (and discarding the subject's completed work) on the
+		// very first occurrence. This is the verbatim shape runRalphCheck
+		// (internal/dispatch/ralph.go) produces via
+		// convergence.ResolveConditionPath.
+		{
+			name: "ralph check gate script directory missing",
+			err:  fmt.Errorf("gsp-abc123: running check: gsp-abc123: resolving check path: gsp-abc123: resolving gate condition path: %w", &fs.PathError{Op: "lstat", Path: "/Users/fernanja/gc-formula-flow/.gc/scripts/checks", Err: syscall.ENOENT}),
+			want: TierSemantic,
+		},
+		{
+			name: "ralph check gate script file missing",
+			err:  fmt.Errorf("gsp-abc123: resolving check path: %w", fmt.Errorf("resolving gate condition path: %w", &fs.PathError{Op: "stat", Path: "/rig/.gc/scripts/checks/verify.sh", Err: syscall.ENOENT})),
+			want: TierSemantic,
+		},
+		// A path-traversal or symlink-escape rejection out of
+		// ResolveConditionPath is a plain fmt.Errorf leaf with no wrapped
+		// fs.ErrNotExist cause -- it must keep quarantining immediately.
+		// Retrying it would not change the answer (the path stays rejected
+		// on every attempt regardless of tier), but this pins that the new
+		// fs.ErrNotExist check does not accidentally widen to cover it via
+		// string-shape alone.
+		{
+			name: "ralph check gate path traversal rejection stays hard",
+			err:  errors.New("gsp-abc123: resolving check path: gsp-abc123: resolving gate condition path: path traversal not allowed: ../../etc/passwd"),
+			want: TierNone,
+		},
+		{
+			name: "ralph check gate not-executable rejection stays hard",
+			err:  errors.New("gsp-abc123: resolving check path: gsp-abc123: resolving gate condition path: file is not executable: /rig/.gc/scripts/checks/verify.sh"),
+			want: TierNone,
+		},
 		{name: "non work query sigterm", err: errors.New("starting provider: exit status 143: Terminated"), want: TierNone},
 		{name: "bad step spec", err: errors.New("deserializing step spec: invalid character 'n'"), want: TierNone},
 		// Availability dominates: a refusal read off a store that is also

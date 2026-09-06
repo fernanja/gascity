@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/execgrace"
+	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/overlay"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/runtime/proctable"
@@ -1009,7 +1010,18 @@ func (o *tmuxStartOps) runSetupCommand(ctx context.Context, cmd string, env map[
 	if workDir := strings.TrimSpace(env["GC_DIR"]); workDir != "" {
 		c.Dir = workDir
 	}
-	c.Env = os.Environ()
+	// Strip leaked GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE (and related)
+	// variables before running pre_start/session_setup/session_live commands.
+	// These commonly run "git -C <dir> worktree add" for dedicated-worktree
+	// provisioning (gc-qi40jt); a git-locating variable inherited from the gc
+	// daemon's own ambient environment (e.g. leaked from a pre-commit hook or
+	// a previous worktree-scoped shell) would make that git invocation
+	// resolve the wrong repository regardless of its explicit -C argument.
+	// Every other git-invoking subprocess call site in this codebase already
+	// strips these (internal/git.go, formula/source.go, importsvc/source.go,
+	// cmd_registry.go, cmd_import.go, cmd_pack_release.go,
+	// checks_rig_root_branch.go); this was the one gap.
+	c.Env = git.SanitizedEnv()
 	for k, v := range env {
 		c.Env = append(c.Env, k+"="+v)
 	}

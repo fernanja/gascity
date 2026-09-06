@@ -10,6 +10,51 @@ import (
 	"time"
 )
 
+// setupCommandGitEnvBlacklist lists git environment variables that must be
+// stripped from a setup command's inherited environment so subprocess git
+// invocations (e.g. pre_start's "git -C <dir> worktree add" for
+// dedicated-worktree provisioning) use the command's own -C/cwd argument,
+// not a parent repo or a previous worktree-scoped shell leaked through the
+// gc daemon's own ambient environment (gc-qi40jt).
+//
+// This is a deliberate, intentionally-duplicated copy of
+// internal/git.gitEnvBlacklist: the root internal/runtime package must stay
+// stdlib-only (see TestRuntimeContractPackageStaysStdlibOnly in
+// import_boundary_test.go, RUNTIME-INV-001), so it cannot import
+// internal/git directly. Keep this list in sync with internal/git/git.go's
+// gitEnvBlacklist if either changes.
+var setupCommandGitEnvBlacklist = map[string]bool{
+	"GIT_COMMON_DIR":                   true,
+	"GIT_CONFIG":                       true,
+	"GIT_CONFIG_COUNT":                 true,
+	"GIT_CONFIG_PARAMETERS":            true,
+	"GIT_DIR":                          true,
+	"GIT_GRAFT_FILE":                   true,
+	"GIT_IMPLICIT_WORK_TREE":           true,
+	"GIT_WORK_TREE":                    true,
+	"GIT_INDEX_FILE":                   true,
+	"GIT_OBJECT_DIRECTORY":             true,
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES": true,
+	"GIT_NO_REPLACE_OBJECTS":           true,
+	"GIT_PREFIX":                       true,
+	"GIT_REPLACE_REF_BASE":             true,
+	"GIT_SHALLOW_FILE":                 true,
+}
+
+// sanitizedSetupEnv returns a copy of the current process environment with
+// the git-locating variables in setupCommandGitEnvBlacklist removed.
+func sanitizedSetupEnv() []string {
+	environ := os.Environ()
+	cleaned := make([]string, 0, len(environ))
+	for _, e := range environ {
+		if k, _, ok := strings.Cut(e, "="); ok && setupCommandGitEnvBlacklist[k] {
+			continue
+		}
+		cleaned = append(cleaned, e)
+	}
+	return cleaned
+}
+
 const (
 	// setupCommandOutputLimit bounds how much stdout/stderr tail is retained
 	// per stream and folded into a setup-command failure message.
@@ -52,7 +97,10 @@ func RunSetupCommand(ctx context.Context, command string, env map[string]string,
 	if workDir := strings.TrimSpace(env["GC_DIR"]); workDir != "" {
 		c.Dir = workDir
 	}
-	c.Env = os.Environ()
+	// Strip leaked GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE (and related)
+	// variables — see tmux's runSetupCommand (internal/runtime/tmux/adapter.go)
+	// for the full rationale (gc-qi40jt).
+	c.Env = sanitizedSetupEnv()
 	for k, v := range env {
 		c.Env = append(c.Env, k+"="+v)
 	}

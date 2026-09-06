@@ -162,6 +162,32 @@ func doctorOrderFiringCurrentLastRunFunc(cityPath string, cfg *config.City, stde
 	}
 }
 
+// activeRigsForDoctorScan returns the non-suspended rigs with a resolved
+// Path, for aggregate doctor checks that scan every rig's own formula/config
+// layer in one pass (e.g. ControlGateScriptsCheck) rather than being
+// registered once per rig inside the per-rig loop below. This applies the
+// same effective-suspension filter (explicit runtime override, falling back
+// to the rig's declared suspended_on_start) as that per-rig loop — opening a
+// suspended rig's bead store can trigger bd auto-starting an orphan Dolt
+// server, so suspended rigs are skipped here too.
+func activeRigsForDoctorScan(cityPath string, cfg *config.City) []config.Rig {
+	if cfg == nil {
+		return nil
+	}
+	suspState := loadSuspensionStateBestEffort(cityPath)
+	var active []config.Rig
+	for _, rig := range cfg.Rigs {
+		if suspensionstate.EffectiveRigSuspended(suspState, rig.Name, rig.EffectiveSuspendedOnStart()) {
+			continue
+		}
+		if strings.TrimSpace(rig.Path) == "" {
+			continue
+		}
+		active = append(active, rig)
+	}
+	return active
+}
+
 func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts buildDoctorChecksOpts) []doctor.Check {
 	var checks []doctor.Check
 	register := func(c doctor.Check) {
@@ -216,6 +242,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		register(doctor.NewOrderFiringCurrentCheck(cfg, cityPath, doctor.WithOrderFiringCurrentLastRunFunc(doctorOrderFiringCurrentLastRunFunc(cityPath, cfg, opts.Stderr))))
 		register(newCodexHooksDriftCheck(cityPath, codexHookWorkDirs(cityPath, cfg)))
 		register(doctor.NewRigPackCoverageCheck(cfg, cityPath))
+		register(doctor.NewControlGateScriptsCheck(cfg, cityPath, activeRigsForDoctorScan(cityPath, cfg)))
 		register(newPackRuntimesDoctorCheck(cfg))
 		register(newMCPConfigDoctorCheck(cityPath, cfg, exec.LookPath))
 		register(newMCPSharedTargetDoctorCheck(cityPath, cfg, exec.LookPath))
@@ -348,6 +375,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 			register(doctor.NewRigPathCheck(rig))
 			register(doctor.NewRigGitCheck(rig))
 			register(doctor.NewRigRootBranchCheck(rig))
+			register(doctor.NewRigWorktreeConfigCheck(rig))
 			register(doctor.NewRigBDSplitStoreCheck(cityPath, rig))
 			register(doctor.NewRigBeadsCheck(cityPath, rig, storeFactory))
 			register(newDoctorRigDoltServerCheck(cityPath, rig, !rigUsesManagedBdStoreContract(cityPath, rig) || opts.SkipRigDoltChecks))

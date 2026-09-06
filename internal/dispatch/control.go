@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -548,6 +549,28 @@ func ClassifyControllerError(err error) ControllerErrorTier {
 	// persistent policy refusal and stays hard/fail-closed.
 	if beads.IsCASRetriesExhausted(err) || beads.IsConditionalWriteUnsupported(err) {
 		return TierAvailability
+	}
+	// A ralph/retry check gate's script path that does not exist yet
+	// (convergence.ResolveConditionPath, via runRalphCheck in
+	// internal/dispatch/ralph.go — e.g. a rig's .gc/scripts/checks/ not yet
+	// provisioned) is plausibly transient rig-provisioning state rather than a
+	// permanent misconfiguration, so it is Tier B rather than an immediate
+	// quarantine: gastownhall/gascity — formula-flow hard-quarantined 19 beads
+	// across 5 step titles within ~14h of a missing .gc/scripts/checks/
+	// directory, discarding one bead's already-completed, tests-passing work
+	// in the process, because this class of error matched no needle below and
+	// fell through to TierNone on the very first occurrence.
+	//
+	// errors.Is(err, fs.ErrNotExist) deliberately does NOT match
+	// ResolveConditionPath's containment/traversal/symlink-escape/
+	// not-a-regular-file/not-executable rejections: those are plain
+	// fmt.Errorf leaves with no wrapped fs.ErrNotExist cause (see
+	// internal/convergence/condition.go), so a genuinely misconfigured or
+	// security-relevant rejection still classifies TierNone and quarantines
+	// immediately, exactly as before. Only "the file/directory is not there
+	// (yet)" gets the bounded grace period.
+	if errors.Is(err, fs.ErrNotExist) {
+		return TierSemantic
 	}
 	msg := strings.ToLower(err.Error())
 	if isTransientWorkQueryFailure(msg) {
