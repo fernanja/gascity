@@ -25,11 +25,19 @@ import (
 // is treated as a genuine failure. Infra re-runs do NOT burn a gc.attempt, so a
 // transport/store outage cannot exhaust a PR's ralph attempts and abort_scope a
 // green PR (maintainer-city incident: 3 attempts burned in one outage). The
-// bound guarantees a gate that can never run (a missing script, a perpetual
-// timeout) still terminates the workflow instead of pending forever. The
-// counter is cloned into each next attempt, so this is the ralph loop's total
-// infra-retry budget; at a ~15s reconcile cadence it rides a multi-minute
-// outage.
+// bound guarantees a gate that can never run (a perpetual timeout) still
+// terminates the workflow instead of pending forever. The counter is cloned
+// into each next attempt, so this is the ralph loop's total infra-retry
+// budget; at a ~15s reconcile cadence it rides a multi-minute outage.
+//
+// A missing check script does NOT flow through this counter: runRalphCheck's
+// convergence.ResolveConditionPath failure returns a plain error, not
+// GateResult{Outcome: GateError}, so it never reaches the GateError/GateTimeout
+// branch below. That case is bounded instead at the ClassifyControllerError
+// layer (control.go, TierSemantic on a bare fs.ErrNotExist) - gc-3gimnj, added
+// after 19 formula-flow beads were hard-quarantined by a rig's
+// not-yet-provisioned .gc/scripts/checks/ (gc-h22mcb: this comment used to
+// claim the two mechanisms were the same one; they are not).
 const maxCheckInfraRetries = 20
 
 func processRalphCheck(store beads.Store, bead beads.Bead, opts ProcessOptions) (ControlResult, error) {

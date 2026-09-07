@@ -775,6 +775,41 @@ func findAgentByName(cfg *config.City, name string) (config.Agent, bool) {
 			}
 		}
 	}
+	// gc-9hmfd5: a named_session's public identity (e.g. "mayor") is distinct
+	// from the [[agents]] entry it instantiates, which is keyed by the
+	// session's Template (e.g. "city-mayor") instead. The --hook path only
+	// works today because it separately resolves a LIVE session's own
+	// .Template via the session store (primeHookSessionTemplate) before ever
+	// calling this function - there is no equivalent for a bare name with no
+	// running session behind it, so `gc prime <named-session-name>` fell
+	// through to "agent not found" and (in non-strict mode) silently
+	// rendered the generic default prompt instead of erroring or resolving
+	// the named session's own template. Walk named_session.Name ->
+	// .Template hops (bounded, not recursive: Template is documented as
+	// referencing an agent template, but nothing stops a miswritten config
+	// from chaining named sessions into each other) until an actual agent
+	// resolves or the chain runs out.
+	seen := map[string]bool{name: true}
+	next := name
+	for hop := 0; hop < len(cfg.NamedSessions)+1; hop++ {
+		var template string
+		for _, ns := range cfg.NamedSessions {
+			if ns.Name == next {
+				template = strings.TrimSpace(ns.Template)
+				break
+			}
+		}
+		if template == "" || seen[template] {
+			break
+		}
+		for _, a := range cfg.Agents {
+			if a.Name == template {
+				return a, true
+			}
+		}
+		seen[template] = true
+		next = template
+	}
 	return config.Agent{}, false
 }
 

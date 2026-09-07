@@ -1704,6 +1704,66 @@ func TestFindAgentByNameSingletonPoolRejectsSuffix(t *testing.T) {
 	}
 }
 
+// gc-9hmfd5: a named_session's public identity (e.g. "mayor") is registered
+// separately from the [[agents]] entry it instantiates, which is keyed by
+// the session's own Template name (e.g. "city-mayor") instead - reproduced
+// live via `gc prime mayor --strict` against this repo's own real config
+// ("agent \"mayor\" not found in city config") before this fix.
+func TestFindAgentByNameResolvesNamedSessionTemplate(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{
+			{Name: "city-mayor", PromptTemplate: "city-mayor"},
+		},
+		NamedSessions: []config.NamedSession{
+			{Name: "mayor", Template: "city-mayor"},
+		},
+	}
+	a, ok := findAgentByName(cfg, "mayor")
+	if !ok {
+		t.Fatal("expected to resolve named_session \"mayor\" to its city-mayor template agent")
+	}
+	if a.Name != "city-mayor" {
+		t.Errorf("Name = %q, want %q", a.Name, "city-mayor")
+	}
+}
+
+// A named_session's Template only counts as a hit if some [[agents]] entry
+// actually carries that name - a dangling reference must not match.
+func TestFindAgentByNameNamedSessionDanglingTemplateMisses(t *testing.T) {
+	cfg := &config.City{
+		NamedSessions: []config.NamedSession{
+			{Name: "mayor", Template: "nonexistent-template"},
+		},
+	}
+	if _, ok := findAgentByName(cfg, "mayor"); ok {
+		t.Fatal("a named_session pointing at a nonexistent agent template must not match")
+	}
+}
+
+// Two named sessions whose Template fields point at each other's Name would
+// recurse forever under a naive implementation; the bounded/visited-set walk
+// must terminate with a miss instead.
+func TestFindAgentByNameNamedSessionCycleTerminates(t *testing.T) {
+	cfg := &config.City{
+		NamedSessions: []config.NamedSession{
+			{Name: "a", Template: "b"},
+			{Name: "b", Template: "a"},
+		},
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, ok := findAgentByName(cfg, "a"); ok {
+			t.Error("a two-named-session cycle has no real agent to find")
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("findAgentByName did not terminate on a named_session cycle")
+	}
+}
+
 func TestFindAgentByNameUnlimitedPool(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{
