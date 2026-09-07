@@ -2,6 +2,7 @@ package dispatch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -912,11 +913,67 @@ func processWorkflowFinalize(store beads.Store, bead beads.Bead, opts ProcessOpt
 	if err != nil {
 		return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: resolving teardown members: %w", rootID, err))
 	}
+	// gc-2up56g: a still-open member that some OTHER member declares a native
+	// step dependency on (gc.native_step_dependencies.v1) is about to get the
+	// exact same bare outcome=skipped as every ordinary unreached step below -
+	// indistinguishable from "had nothing to do" even though something else's
+	// readiness was declared to depend on it actually completing (the concrete
+	// incident: build-from-plan's own publish step, force-closed this way with
+	// gc.build.publish_status never recorded, silently stranding real
+	// completed implementation work - gcas-1vxk3r/gcas-ngyyiz). Carve these out
+	// of the uniform sweep and close them with an extra marker so a downstream
+	// consumer (or a human reading gc.native_step_dependency_skipped) can tell
+	// a skipped native dependency apart from a step that simply had nothing to
+	// do. This is deliberately a generic engine-level marker, not
+	// gc.build.publish_status specifically - that vocabulary belongs to the
+	// build-from-plan formula (gc-a53ow1's companion pack-side mitigation),
+	// not this engine package.
+	members, err := molecule.ListSubtree(store, rootID)
+	if err != nil {
+		return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: resolving subtree members: %w", rootID, err))
+	}
+	dependencyTargets := nativeStepDependencyTargets(members)
+	var skippedDependencyTargets []string
+	for _, member := range members {
+		if member.Status == "closed" {
+			continue
+		}
+		if member.Metadata[beadmeta.ScopeRoleMetadataKey] == beadmeta.ScopeRoleTeardown {
+			continue
+		}
+		stepID := strings.TrimSpace(member.Metadata[beadmeta.StepIDMetadataKey])
+		if stepID == "" {
+			continue
+		}
+		if _, isTarget := dependencyTargets[stepID]; isTarget {
+			skippedDependencyTargets = append(skippedDependencyTargets, member.ID)
+		}
+	}
+	excludeTeardownAndDependencyTargets := func(member beads.Bead) bool {
+		if excludeTeardown(member) {
+			return true
+		}
+		for _, id := range skippedDependencyTargets {
+			if member.ID == id {
+				return true
+			}
+		}
+		return false
+	}
 	if _, err := molecule.CloseSubtreeWithMetadataExcept(store, rootID, map[string]string{
 		beadmeta.OutcomeMetadataKey: beadmeta.OutcomeSkipped,
 		"close_reason":              sourceworkflow.WorkflowSkippedCloseReason,
-	}, excludeTeardown); err != nil {
+	}, excludeTeardownAndDependencyTargets); err != nil {
 		return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: closing terminal workflow members: %w", rootID, err))
+	}
+	if len(skippedDependencyTargets) > 0 {
+		if _, err := store.CloseAll(skippedDependencyTargets, map[string]string{
+			beadmeta.OutcomeMetadataKey:                    beadmeta.OutcomeSkipped,
+			"close_reason":                                 sourceworkflow.WorkflowSkippedCloseReason,
+			beadmeta.NativeStepDependencySkippedMetadataKey: "true",
+		}); err != nil {
+			return ControlResult{}, recordWorkflowFinalizeError(store, bead.ID, fmt.Errorf("%s: closing skipped native step dependency targets: %w", rootID, err))
+		}
 	}
 	if outcome == beadmeta.OutcomePass {
 		if err := closeSourceBeadChain(store, rootID, opts); err != nil {
@@ -978,6 +1035,41 @@ func teardownTailExclusion(store beads.Store, rootID string) (func(beads.Bead) b
 		_, ok := teardownStepIDs[stepID]
 		return ok
 	}, nil
+}
+
+// nativeStepDependencyTargets returns the set of gc.step_id values that some
+// OTHER member of the subtree names in its own gc.native_step_dependencies.v1
+// - i.e. steps something else's readiness is declared to depend on completing,
+// as opposed to a plain bd blocking dependency the generic close path already
+// treats uniformly. Used to flag when the terminal "close everything
+// remaining as skipped" sweep below is about to force-close one of these
+// specifically (gc-2up56g): the sweep applies uniformly to every open member
+// regardless of role, so a native step target that never actually ran (e.g.
+// build-from-plan's own publish step, still open when the workflow finalizes
+// via review rather than by every step completing) got the exact same bare
+// outcome=skipped as everything else, indistinguishable from a step that
+// simply had nothing to do. This lenient parse intentionally skips
+// decodeNativeStepDependencies' compile-time strict validation (sorted,
+// no self-reference, canonical JSON) - it only needs to know which step IDs
+// are referenced at all, not whether the declaration is well-formed.
+func nativeStepDependencyTargets(members []beads.Bead) map[string]struct{} {
+	targets := make(map[string]struct{})
+	for _, member := range members {
+		raw := member.Metadata[beadmeta.NativeStepDependenciesMetadataKey]
+		if raw == "" {
+			continue
+		}
+		var deps []string
+		if err := json.Unmarshal([]byte(raw), &deps); err != nil {
+			continue
+		}
+		for _, dep := range deps {
+			if dep = strings.TrimSpace(dep); dep != "" {
+				targets[dep] = struct{}{}
+			}
+		}
+	}
+	return targets
 }
 
 func preflightSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOptions) error {

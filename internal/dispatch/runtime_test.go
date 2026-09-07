@@ -3038,6 +3038,97 @@ func TestProcessWorkflowFinalizeClosesRemainingGeneratedMembers(t *testing.T) {
 	}
 }
 
+// gc-2up56g: a still-open member that some OTHER member's
+// gc.native_step_dependencies.v1 names is force-closed by the same terminal
+// sweep as every ordinary unreached step, but must carry a distinguishing
+// marker - the concrete incident this reproduces is build-from-plan's own
+// publish step getting force-closed with gc.build.publish_status never
+// recorded, indistinguishable from a step that simply had nothing to do.
+func TestProcessWorkflowFinalizeMarksSkippedNativeStepDependencyTarget(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	// A step that references the publish step as a native dependency -
+	// establishes "build-from-plan.publish" as a dependency target somewhere
+	// in the subtree, mirroring workflow-finalize's own
+	// gc.native_step_dependencies.v1=["build-from-plan.publish"] declaration
+	// in the real incident.
+	mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "downstream step",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id":                workflow.ID,
+			"gc.step_ref":                     "downstream",
+			"gc.native_step_dependencies.v1": `["build-from-plan.publish"]`,
+		},
+	})
+	publish := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "publish",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": workflow.ID,
+			"gc.step_ref":     "publish",
+			"gc.step_id":      "build-from-plan.publish",
+		},
+	})
+	ordinary := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "unrelated unreached step",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.root_bead_id": workflow.ID,
+			"gc.step_ref":     "unused",
+			"gc.step_id":      "some-other-step",
+		},
+	})
+	finalizer := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "workflow-finalize",
+			"gc.root_bead_id": workflow.ID,
+		},
+	})
+	mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+
+	result, err := ProcessControl(store, finalizer, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if !result.Processed || result.Action != "workflow-pass" {
+		t.Fatalf("workflow result = %+v, want processed workflow-pass", result)
+	}
+
+	publishAfter := mustGetBead(t, store, publish.ID)
+	if publishAfter.Status != "closed" {
+		t.Fatalf("publish step status = %q, want closed", publishAfter.Status)
+	}
+	if got := publishAfter.Metadata["gc.outcome"]; got != "skipped" {
+		t.Fatalf("publish step gc.outcome = %q, want skipped", got)
+	}
+	if got := publishAfter.Metadata[beadmeta.NativeStepDependencySkippedMetadataKey]; got != "true" {
+		t.Fatalf("publish step %s = %q, want %q", beadmeta.NativeStepDependencySkippedMetadataKey, got, "true")
+	}
+
+	ordinaryAfter := mustGetBead(t, store, ordinary.ID)
+	if ordinaryAfter.Status != "closed" {
+		t.Fatalf("ordinary step status = %q, want closed", ordinaryAfter.Status)
+	}
+	if got := ordinaryAfter.Metadata["gc.outcome"]; got != "skipped" {
+		t.Fatalf("ordinary step gc.outcome = %q, want skipped", got)
+	}
+	if got, ok := ordinaryAfter.Metadata[beadmeta.NativeStepDependencySkippedMetadataKey]; ok {
+		t.Fatalf("ordinary step must NOT carry %s, got %q", beadmeta.NativeStepDependencySkippedMetadataKey, got)
+	}
+}
+
 func TestProcessWorkflowFinalizeTreatsQuarantinedControlAsFailure(t *testing.T) {
 	t.Parallel()
 
