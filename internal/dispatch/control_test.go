@@ -2950,6 +2950,73 @@ func TestRouteConfigEmptyCityPathIsNilNoError(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// ensureFailureReasonRecorded tests (gc-0uz03y)
+// ---------------------------------------------------------------------------
+
+func TestEnsureFailureReasonRecordedStampsWhenNothingRecorded(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+	bead := mustCreate(t, store, beads.Bead{Title: "unlucky step"})
+
+	got := ensureFailureReasonRecorded(store, bead.ID, map[string]string{
+		beadmeta.OutcomeMetadataKey: beadmeta.OutcomeFail,
+	})
+
+	if got[beadmeta.OutcomeMetadataKey] != beadmeta.OutcomeFail {
+		t.Fatalf("outcome must be preserved, got %v", got)
+	}
+	if strings.TrimSpace(got[beadmeta.FailureReasonMetadataKey]) == "" {
+		t.Fatalf("expected a stamped failure reason, got %v", got)
+	}
+}
+
+func TestEnsureFailureReasonRecordedLeavesProvidedReasonAlone(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+	bead := mustCreate(t, store, beads.Bead{Title: "step with a reason"})
+
+	input := map[string]string{
+		beadmeta.OutcomeMetadataKey:       beadmeta.OutcomeFail,
+		beadmeta.FailureReasonMetadataKey: "timeout waiting on prerequisite",
+	}
+	got := ensureFailureReasonRecorded(store, bead.ID, input)
+
+	if got[beadmeta.FailureReasonMetadataKey] != "timeout waiting on prerequisite" {
+		t.Fatalf("must not overwrite a caller-provided reason, got %v", got)
+	}
+}
+
+func TestEnsureFailureReasonRecordedRespectsExistingCloseReason(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+	bead := mustCreate(t, store, beads.Bead{
+		Title:    "step already annotated",
+		Metadata: map[string]string{"close_reason": "prerequisite step never landed"},
+	})
+
+	got := ensureFailureReasonRecorded(store, bead.ID, map[string]string{
+		beadmeta.OutcomeMetadataKey: beadmeta.OutcomeFail,
+	})
+
+	if _, stamped := got[beadmeta.FailureReasonMetadataKey]; stamped {
+		t.Fatalf("must not stamp when an existing close_reason already explains the failure, got %v", got)
+	}
+}
+
+func TestEnsureFailureReasonRecordedIgnoresNonFailOutcomes(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+	bead := mustCreate(t, store, beads.Bead{Title: "successful step"})
+
+	input := map[string]string{beadmeta.OutcomeMetadataKey: "pass"}
+	got := ensureFailureReasonRecorded(store, bead.ID, input)
+
+	if _, stamped := got[beadmeta.FailureReasonMetadataKey]; stamped {
+		t.Fatalf("must never touch a non-fail outcome, got %v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
 

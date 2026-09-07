@@ -11,6 +11,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/git"
 )
 
 // Work-record close gate (ADR-0009). Closing a work bead through the SDK close
@@ -155,7 +156,9 @@ func gitCommitReachableOnBranch(repoDir, commit, branch string) bool {
 	if strings.HasPrefix(commit, "-") || strings.HasPrefix(branch, "-") {
 		return false
 	}
-	return exec.Command("git", "-C", repoDir, "merge-base", "--is-ancestor", commit, branch).Run() == nil
+	cmd := exec.Command("git", "-C", repoDir, "merge-base", "--is-ancestor", commit, branch)
+	cmd.Env = git.SanitizedEnv()
+	return cmd.Run() == nil
 }
 
 // workRecordCloseTargets returns the bead IDs a bd invocation closes, and

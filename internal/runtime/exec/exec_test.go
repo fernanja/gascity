@@ -370,7 +370,14 @@ case "$op" in
 esac
 `)
 	p := NewProvider(script)
-	p.startTimeout = 200 * time.Millisecond
+	// 200ms was too tight: real process startup (fork+exec+shell init) can
+	// occasionally lose the race against the deadline before the box is even
+	// created, especially on a loaded machine or a cold-started test binary
+	// (gc-x1e9mw) - failing before the script's first line runs at all, not
+	// because teardown-on-cancel is broken. 3s keeps the deadline firing well
+	// before the `sleep 30` below completes (the actual thing under test)
+	// while giving realistic startup overhead enough margin.
+	p.startTimeout = 3 * time.Second
 
 	err := p.Start(context.Background(), "test-sess", runtime.Config{})
 	if err == nil {

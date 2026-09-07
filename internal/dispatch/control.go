@@ -1879,6 +1879,7 @@ func copyNonGCMetadata(dst, src map[string]string) {
 }
 
 func updateMetadataAndClose(store beads.Store, beadID string, metadata map[string]string) error {
+	metadata = ensureFailureReasonRecorded(store, beadID, metadata)
 	status := "closed"
 	if err := store.Update(beadID, beads.UpdateOpts{
 		Status:   &status,
@@ -1894,6 +1895,37 @@ func updateMetadataAndClose(store beads.Store, beadID string, metadata map[strin
 		return nil
 	}
 	return store.Close(beadID)
+}
+
+// ensureFailureReasonRecorded guards against a gc.outcome=fail close landing
+// with no diagnostic trace at all (gc-0uz03y): six formula-flow beads closed
+// this way in one incident window, and with zero recorded reason a
+// retrospective audit (e.g. daily-introspect-city) cannot tell why after the
+// fact. If metadata sets outcome=fail and neither it nor the bead's existing
+// state already carries a close_reason or gc.failure_reason, stamp a
+// distinguishing marker into the write rather than let it close silent.
+// Warn-only in spirit — never blocks the close, and a Get failure here just
+// skips the stamp (the close still proceeds via the caller's own metadata).
+func ensureFailureReasonRecorded(store beads.Store, beadID string, metadata map[string]string) map[string]string {
+	if metadata[beadmeta.OutcomeMetadataKey] != beadmeta.OutcomeFail {
+		return metadata
+	}
+	if strings.TrimSpace(metadata["close_reason"]) != "" || strings.TrimSpace(metadata[beadmeta.FailureReasonMetadataKey]) != "" {
+		return metadata
+	}
+	existing, err := store.Get(beadID)
+	if err != nil {
+		return metadata
+	}
+	if strings.TrimSpace(existing.Metadata["close_reason"]) != "" || strings.TrimSpace(existing.Metadata[beadmeta.FailureReasonMetadataKey]) != "" {
+		return metadata
+	}
+	stamped := make(map[string]string, len(metadata)+1)
+	for k, v := range metadata {
+		stamped[k] = v
+	}
+	stamped[beadmeta.FailureReasonMetadataKey] = "unspecified (gc-0uz03y: outcome=fail closed with no close_reason or failure_reason recorded)"
+	return stamped
 }
 
 // Note: setOutcomeAndClose, propagateRetrySubjectMetadata,

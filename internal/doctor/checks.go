@@ -2478,19 +2478,19 @@ func (c *DoltNomsSizeCheck) Run(_ *CheckContext) *CheckResult {
 	case worstBytes >= doltNomsErrorBytes:
 		r.Status = StatusError
 		r.Message = fmt.Sprintf("dolt noms directory for %s is %s%s — excessive; recovery recommended", targetLabel, size, scopeNote)
-		r.FixHint = "see docs/troubleshooting/dolt-bloat-recovery.md"
+		r.FixHint = "see https://github.com/gastownhall/gascity/blob/main/docs/troubleshooting/dolt-bloat-recovery.md"
 	case totalBytes >= doltNomsErrorBytes:
 		r.Status = StatusError
 		r.Message = fmt.Sprintf("aggregate dolt data footprint is %s across %d databases — excessive; recovery recommended", formatGB(totalBytes), existsCount)
-		r.FixHint = "see docs/troubleshooting/dolt-bloat-recovery.md"
+		r.FixHint = "see https://github.com/gastownhall/gascity/blob/main/docs/troubleshooting/dolt-bloat-recovery.md"
 	case worstBytes >= doltNomsWarnBytes:
 		r.Status = StatusWarning
 		r.Message = fmt.Sprintf("dolt noms directory for %s is %s%s — approaching threshold", targetLabel, size, scopeNote)
-		r.FixHint = "see docs/troubleshooting/dolt-bloat-recovery.md"
+		r.FixHint = "see https://github.com/gastownhall/gascity/blob/main/docs/troubleshooting/dolt-bloat-recovery.md"
 	case totalBytes >= doltNomsWarnBytes:
 		r.Status = StatusWarning
 		r.Message = fmt.Sprintf("aggregate dolt data footprint is %s across %d databases — approaching threshold", formatGB(totalBytes), existsCount)
-		r.FixHint = "see docs/troubleshooting/dolt-bloat-recovery.md"
+		r.FixHint = "see https://github.com/gastownhall/gascity/blob/main/docs/troubleshooting/dolt-bloat-recovery.md"
 	default:
 		r.Status = StatusOK
 		if existsCount > 1 {

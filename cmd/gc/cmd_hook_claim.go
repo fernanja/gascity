@@ -17,6 +17,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/executionevent"
+	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/graphroute"
 )
 
@@ -1684,7 +1685,9 @@ func hookResolveWorkBranch(dir string) string {
 	if strings.TrimSpace(dir) == "" {
 		return ""
 	}
-	out, err := exec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD").Output()
+	cmd := exec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD")
+	cmd.Env = git.SanitizedEnv()
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
