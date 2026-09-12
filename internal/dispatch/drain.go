@@ -59,6 +59,23 @@ func processDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Cont
 }
 
 func expandDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (ControlResult, error) {
+	// gcas-jej7j4: bd's own readiness projection unblocks this control bead the
+	// moment every step named in its `needs` CLOSES - it has no notion of
+	// outcome, so a drain whose only declared prerequisite is a failed
+	// prepare/validation step becomes just as "ready" as one whose prerequisite
+	// passed. Nothing downstream re-checks that before this point: the compiler
+	// wires `needs` into a real bd "blocks" edge (formula.collectRecipeDeps),
+	// and outcome-aware failure propagation is otherwise specified ONLY for
+	// scope members via gc.on_fail=abort_scope (formula-spec-v2.md section
+	// 3.5) - a plain step chain like this formula's prepare -> drain has no
+	// such contract at all. Check the canonical native-step topology fact
+	// before doing anything else so a failed upstream step fails this drain
+	// closed instead of silently scattering real work.
+	if upstream, failed, err := nativeStepDependencyFailure(store, bead); err != nil {
+		return ControlResult{}, fmt.Errorf("%s: checking native step dependencies: %w", bead.ID, err)
+	} else if failed {
+		return closeDrainUpstreamDependencyFailure(store, bead, upstream, opts)
+	}
 	if len(opts.FormulaSearchPaths) == 0 {
 		return ControlResult{}, fmt.Errorf("%s: missing formula search paths", bead.ID)
 	}
@@ -201,6 +218,84 @@ func expandDrain(store beads.Store, bead beads.Bead, opts ProcessOptions) (Contr
 		return completeDrain(store, reloaded, opts)
 	}
 	return ControlResult{Processed: true, Action: "drain-expanded", Created: totalCreated}, nil
+}
+
+// nativeStepDependencyFailure reports the first upstream native-step
+// dependency of bead - per its own canonical gc.native_step_dependencies.v1
+// declaration (recipeStepsWithNativeStepDependencies) - that has already
+// closed with a failing outcome. bead's own gc.step_id is used only to
+// satisfy beads.NativeStepDependencies' self-edge validation; the returned
+// list is bead's dependencies, not its identity.
+//
+// A missing/unknown declaration, or a referenced dependency step this root's
+// subtree cannot resolve, is deliberately NOT a failure: the declaration is a
+// best-effort recorded fact, not the authoritative block (the real gate is
+// bd's own "blocks" dependency, wired straight from `needs` by
+// formula.collectRecipeDeps), and "can't tell" must never manufacture a false
+// failure for an otherwise-healthy drain. Retry-managed attempt subjects are
+// excluded from the step_id lookup the same way beadOutcomeFailed excludes
+// them from abort-scope aggregation: an attempt is not the canonical bead for
+// its logical step's outcome.
+func nativeStepDependencyFailure(store beads.Store, bead beads.Bead) (beads.Bead, bool, error) {
+	stepID := strings.TrimSpace(bead.Metadata[beadmeta.StepIDMetadataKey])
+	dependencies := beads.NativeStepDependencies(bead.Metadata, stepID)
+	if dependencies == nil || len(*dependencies) == 0 {
+		return beads.Bead{}, false, nil
+	}
+	rootID := strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
+	if rootID == "" {
+		return beads.Bead{}, false, nil
+	}
+	members, err := molecule.ListSubtree(store, rootID)
+	if err != nil {
+		return beads.Bead{}, false, err
+	}
+	byStepID := make(map[string]beads.Bead, len(members))
+	for _, member := range members {
+		id := strings.TrimSpace(member.Metadata[beadmeta.StepIDMetadataKey])
+		if id == "" || isRetryAttemptSubject(member) {
+			continue
+		}
+		byStepID[id] = member
+	}
+	for _, dep := range *dependencies {
+		upstream, ok := byStepID[dep]
+		if !ok || upstream.Status != "closed" {
+			continue
+		}
+		if beadOutcomeFailed(upstream) {
+			return upstream, true, nil
+		}
+	}
+	return beads.Bead{}, false, nil
+}
+
+// closeDrainUpstreamDependencyFailure closes bead - a drain control step that
+// has not yet built or persisted a manifest - as failed instead of scattering
+// it, because the upstream step named in its own gc.native_step_dependencies.v1
+// declaration already closed with a failing outcome (see
+// nativeStepDependencyFailure). Nothing has been reserved or created yet at
+// this call site (it runs before loadOrBuildDrainManifest), so there is no
+// manifest or reservation to unwind - unlike closeDrainReservationFailure and
+// closeDrainItemFormulaFailure, which close a drain that already made partial
+// progress.
+func closeDrainUpstreamDependencyFailure(store beads.Store, bead, upstream beads.Bead, opts ProcessOptions) (ControlResult, error) {
+	const failureReason = "upstream_native_dependency_failed"
+	metadata := map[string]string{
+		beadmeta.DrainStateMetadataKey:     beadmeta.DrainStateFailed,
+		beadmeta.OutcomeMetadataKey:        beadmeta.OutcomeFail,
+		beadmeta.FailureClassMetadataKey:   beadmeta.FailureClassHard,
+		beadmeta.FailureReasonMetadataKey:  failureReason,
+		beadmeta.FailureSubjectMetadataKey: upstream.ID,
+	}
+	if closeErr := updateMetadataAndClose(store, bead.ID, metadata); closeErr != nil {
+		return ControlResult{}, fmt.Errorf("%s: closing drain after upstream step %s failed: %w", bead.ID, upstream.ID, closeErr)
+	}
+	scopeResult, scopeErr := reconcileClosedDrainScope(store, bead.ID, opts)
+	if scopeErr != nil {
+		return ControlResult{}, scopeErr
+	}
+	return ControlResult{Processed: true, Action: "drain-upstream-dependency-failed", Skipped: scopeResult.Skipped}, nil
 }
 
 func loadOrBuildDrainManifest(store beads.Store, bead beads.Bead, parentConvoyID, itemFormula string, opts ProcessOptions) (drainManifest, []beads.Bead, error) {

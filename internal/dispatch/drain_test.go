@@ -386,6 +386,229 @@ func TestProcessDrainSeparateFailsClosedWhenMaxUnitsExceeded(t *testing.T) {
 	}
 }
 
+// TestProcessDrainClosesFailedWhenNativeStepDependencyFailed reproduces
+// gcas-jej7j4 / gcas-cyk70s: a "prepare"-equivalent plain step closes with
+// gc.outcome=fail, and a "drain"-equivalent control step declares a native
+// step dependency on it (the compiled shape of `needs = ["prepare"]` in
+// implement.formula.toml). bd's own readiness projection unblocks the drain
+// the moment prepare CLOSES - it has no notion of outcome - so before this
+// fix the drain expanded (scattered real convoy/unit-root work) exactly as if
+// prepare had passed. This test does not even supply FormulaSearchPaths or a
+// drain item formula: if the gate fails to fire, expandDrain fails for the
+// unrelated reason of missing search paths rather than closing fail for the
+// right one, so a regression here cannot silently pass by accident.
+func TestProcessDrainClosesFailedWhenNativeStepDependencyFailed(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	root := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	prepare := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "prepare",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.root_bead_id":  root.ID,
+			"gc.step_id":       "prepare",
+			"gc.outcome":       "fail",
+			"gc.failure_class": "invalid_context_bundle",
+		},
+	})
+	drain := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "drain-separate",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":                        "drain",
+			"gc.root_bead_id":                root.ID,
+			"gc.step_id":                     "drain",
+			"gc.native_step_dependencies.v1": `["prepare"]`,
+			"gc.drain_context":               "separate",
+			"gc.drain_formula":               "drain-item",
+			"gc.drain_member_access":         "read",
+		},
+	})
+	mustDepAdd(t, store, drain.ID, prepare.ID, "blocks")
+
+	result, err := ProcessControl(store, drain, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(drain blocked by failed prepare): %v", err)
+	}
+	if result.Action != "drain-upstream-dependency-failed" {
+		t.Fatalf("Action = %q, want drain-upstream-dependency-failed", result.Action)
+	}
+	if result.Created != 0 {
+		t.Fatalf("Created = %d, want 0: a failed upstream step must produce zero scatter side effects", result.Created)
+	}
+
+	drainAfter := mustGetBead(t, store, drain.ID)
+	if drainAfter.Status != "closed" || drainAfter.Metadata["gc.outcome"] != "fail" {
+		t.Fatalf("drain = status %q outcome %q, want closed/fail", drainAfter.Status, drainAfter.Metadata["gc.outcome"])
+	}
+	if got := drainAfter.Metadata["gc.failure_reason"]; got != "upstream_native_dependency_failed" {
+		t.Fatalf("gc.failure_reason = %q, want upstream_native_dependency_failed", got)
+	}
+	if got := drainAfter.Metadata["gc.failure_subject"]; got != prepare.ID {
+		t.Fatalf("gc.failure_subject = %q, want %q (the failed prepare bead)", got, prepare.ID)
+	}
+	if got := drainAfter.Metadata["gc.drain_state"]; got != "failed" {
+		t.Fatalf("gc.drain_state = %q, want failed", got)
+	}
+	if got := strings.TrimSpace(drainAfter.Metadata[drainManifestMetadataKey]); got != "" {
+		t.Fatalf("drain manifest = %q, want empty: expandDrain must never have started building a manifest", got)
+	}
+}
+
+// TestProcessDrainNativeStepDependencyFailureCascadesToWorkflowFinalize
+// extends the same scenario one hop further, standing a second drain-kind
+// control step in for the formula's "publish" step (in implement.formula.toml
+// publish is a plain agent-routed step outside this package's control-dispatch
+// surface, but it declares the exact same native-step-dependency contract on
+// its own predecessor). It proves two things the acceptance criteria for
+// gcas-jej7j4 both require: the fix cascades - "publish" refuses to run for
+// the same reason "drain" did, once "drain" itself is the closed-failed
+// upstream - and workflow-finalize records the failure as the WORKFLOW ROOT's
+// own terminal outcome instead of a silent pass-through.
+func TestProcessDrainNativeStepDependencyFailureCascadesToWorkflowFinalize(t *testing.T) {
+	t.Parallel()
+
+	store := beads.NewMemStore()
+	root := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	prepare := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "prepare",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.root_bead_id":  root.ID,
+			"gc.step_id":       "prepare",
+			"gc.outcome":       "fail",
+			"gc.failure_class": "invalid_context_bundle",
+		},
+	})
+	drain := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "drain-separate",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":                        "drain",
+			"gc.root_bead_id":                root.ID,
+			"gc.step_id":                     "drain",
+			"gc.native_step_dependencies.v1": `["prepare"]`,
+			"gc.drain_context":               "separate",
+			"gc.drain_formula":               "drain-item",
+			"gc.drain_member_access":         "read",
+		},
+	})
+	mustDepAdd(t, store, drain.ID, prepare.ID, "blocks")
+	publish := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "publish",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":                        "drain",
+			"gc.root_bead_id":                root.ID,
+			"gc.step_id":                     "publish",
+			"gc.native_step_dependencies.v1": `["drain"]`,
+			"gc.drain_context":               "separate",
+			"gc.drain_formula":               "drain-item",
+			"gc.drain_member_access":         "read",
+		},
+	})
+	mustDepAdd(t, store, publish.ID, drain.ID, "blocks")
+	finalize := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "Finalize workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "workflow-finalize",
+			"gc.root_bead_id": root.ID,
+		},
+	})
+	mustDepAdd(t, store, finalize.ID, publish.ID, "blocks")
+	mustDepAdd(t, store, root.ID, finalize.ID, "blocks")
+
+	drainResult, err := ProcessControl(store, drain, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(drain): %v", err)
+	}
+	if drainResult.Action != "drain-upstream-dependency-failed" {
+		t.Fatalf("drain Action = %q, want drain-upstream-dependency-failed", drainResult.Action)
+	}
+
+	publishResult, err := ProcessControl(store, mustGetBead(t, store, publish.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(publish): %v", err)
+	}
+	if publishResult.Action != "drain-upstream-dependency-failed" {
+		t.Fatalf("publish Action = %q, want drain-upstream-dependency-failed (the gate must cascade, not just fire once)", publishResult.Action)
+	}
+	publishAfter := mustGetBead(t, store, publish.ID)
+	if publishAfter.Status != "closed" || publishAfter.Metadata["gc.outcome"] != "fail" {
+		t.Fatalf("publish = status %q outcome %q, want closed/fail", publishAfter.Status, publishAfter.Metadata["gc.outcome"])
+	}
+	if got := publishAfter.Metadata["gc.failure_subject"]; got != drain.ID {
+		t.Fatalf("publish gc.failure_subject = %q, want %q (the failed drain bead)", got, drain.ID)
+	}
+
+	finalizeResult, err := ProcessControl(store, mustGetBead(t, store, finalize.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+	}
+	if finalizeResult.Action != "workflow-fail" {
+		t.Fatalf("finalize Action = %q, want workflow-fail", finalizeResult.Action)
+	}
+	rootAfter := mustGetBead(t, store, root.ID)
+	if rootAfter.Status != "closed" || rootAfter.Metadata["gc.outcome"] != "fail" {
+		t.Fatalf("root = status %q outcome %q, want closed/fail: workflow finalization must record the failed validation as the root outcome, not pass through silently", rootAfter.Status, rootAfter.Metadata["gc.outcome"])
+	}
+}
+
+// TestProcessDrainProceedsWhenNativeStepDependencyPassed guards the happy
+// path: a drain step that declares a native step dependency on a step that
+// PASSED must expand exactly as if no gate existed at all. Regressing this
+// into an unconditional gate would break every ordinary implement workflow
+// where nothing failed.
+func TestProcessDrainProceedsWhenNativeStepDependencyPassed(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeDrainItemFormula(t, dir)
+	store, drain := seedDrainWorkflow(t)
+	prepare := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "prepare",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.root_bead_id": drain.Metadata["gc.root_bead_id"],
+			"gc.step_id":      "prepare",
+			"gc.outcome":      "pass",
+		},
+	})
+	if err := store.SetMetadata(drain.ID, "gc.step_id", "drain"); err != nil {
+		t.Fatalf("SetMetadata(step id): %v", err)
+	}
+	if err := store.SetMetadata(drain.ID, "gc.native_step_dependencies.v1", `["prepare"]`); err != nil {
+		t.Fatalf("SetMetadata(native step dependencies): %v", err)
+	}
+	mustDepAdd(t, store, drain.ID, prepare.ID, "blocks")
+
+	result, err := ProcessControl(store, mustGetBead(t, store, drain.ID), ProcessOptions{FormulaSearchPaths: []string{dir}})
+	if err != nil {
+		t.Fatalf("ProcessControl(drain expand): %v", err)
+	}
+	if result.Action != "drain-expanded" || result.Created != 4 {
+		t.Fatalf("result = %+v, want drain-expanded with two units and two roots: a PASSED native dependency must not block expansion", result)
+	}
+}
+
 func TestProcessDrainSharedAdvancesOneItemAtATime(t *testing.T) {
 	formulatest.EnableV2ForTest(t)
 	dir := t.TempDir()
