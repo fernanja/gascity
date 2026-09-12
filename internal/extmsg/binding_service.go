@@ -415,9 +415,53 @@ func (s *bindingService) ListBySession(ctx context.Context, sessionID string) ([
 	if sessionID == "" {
 		return nil, nil
 	}
-	items, err := s.store.List(beads.ListQuery{Label: bindingSessionLabel(sessionID)})
+	out, err := s.listActiveBindingsByLabel(ctx, bindingSessionLabel(sessionID), func(r SessionBindingRecord) bool {
+		return r.SessionID == sessionID
+	})
 	if err != nil {
-		return nil, fmt.Errorf("list bindings by session label: %w", err)
+		return nil, err
+	}
+
+	// A binding created via agent_name (Bind's other targeting mode, e.g. a
+	// durable named-session agent like "mayor") is labeled bindingAgentLabel,
+	// never bindingSessionLabel -- its live session is resolved at delivery
+	// time, not at bind time, so there is no session-id label to have queried
+	// above even when sessionID IS that agent's current live session. Without
+	// this second pass, every caller of ListBySession (gc slack publish's
+	// binding lookup, chiefly) reports "no active extmsg binding" for an
+	// agent-bound conversation even immediately after `gc slack bind-dm`
+	// reports it bound -- confirmed 2026-09-12, gc-idi3u5: GET
+	// .../extmsg/bindings?session_id=<mayor's session id> returned empty
+	// while POST .../extmsg/bind's own conflict check on the same conversation
+	// correctly reported "already bound to agent mayor" in the same breath,
+	// because Bind's conflict check queries by CONVERSATION
+	// (listBindingsForConversation) and so sees both label types, while this
+	// method queried only the session-id label. Silent failure mode: nothing
+	// here errors, the agent-bound conversation just never appears.
+	if s.sessions != nil {
+		if info, resolveErr := s.sessions.ResolveAddress(sessionID, true); resolveErr == nil && info.AgentName != "" {
+			agentName := info.AgentName
+			agentBindings, err := s.listActiveBindingsByLabel(ctx, bindingAgentLabel(agentName), func(r SessionBindingRecord) bool {
+				return r.AgentName == agentName
+			})
+			if err != nil {
+				return nil, err
+			}
+			out = mergeBindingsByConversation(out, agentBindings)
+		}
+	}
+	return out, nil
+}
+
+// listActiveBindingsByLabel lists binding beads under label, decodes and
+// filters each with match, resolves each matching conversation's current
+// active binding, and returns those still active. Extracted from
+// ListBySession so its session-id pass and agent-name pass (see above) share
+// one implementation instead of two copies that could drift.
+func (s *bindingService) listActiveBindingsByLabel(ctx context.Context, label string, match func(SessionBindingRecord) bool) ([]SessionBindingRecord, error) {
+	items, err := s.store.List(beads.ListQuery{Label: label})
+	if err != nil {
+		return nil, fmt.Errorf("list bindings by label %q: %w", label, err)
 	}
 	seen := make(map[string]bool, len(items))
 	out := make([]SessionBindingRecord, 0, len(items))
@@ -432,7 +476,7 @@ func (s *bindingService) ListBySession(ctx context.Context, sessionID string) ([
 		if err != nil {
 			return nil, err
 		}
-		if record.SessionID != sessionID {
+		if !match(record) {
 			continue
 		}
 		key := conversationLockKey(record.Conversation)
@@ -444,11 +488,34 @@ func (s *bindingService) ListBySession(ctx context.Context, sessionID string) ([
 		if err != nil {
 			return nil, err
 		}
-		if active != nil && active.SessionID == sessionID {
+		if active != nil && match(*active) {
 			out = append(out, *active)
 		}
 	}
 	return out, nil
+}
+
+// mergeBindingsByConversation appends additional to existing, skipping any
+// record whose conversation is already present -- kept as a distinct final
+// step (rather than sharing one `seen` map across both
+// listActiveBindingsByLabel passes) so a conversation whose ONLY matching
+// bead under the first label is a stale/inactive one can still be found by
+// the second pass: sharing `seen` across passes would mark it visited by the
+// first pass's non-matching resolution and wrongly suppress the second.
+func mergeBindingsByConversation(existing, additional []SessionBindingRecord) []SessionBindingRecord {
+	seen := make(map[string]bool, len(existing))
+	for _, r := range existing {
+		seen[conversationLockKey(r.Conversation)] = true
+	}
+	for _, r := range additional {
+		key := conversationLockKey(r.Conversation)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		existing = append(existing, r)
+	}
+	return existing
 }
 
 func (s *bindingService) Touch(ctx context.Context, caller Caller, bindingID string, now time.Time) error {

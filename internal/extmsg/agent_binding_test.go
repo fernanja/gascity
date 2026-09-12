@@ -9,6 +9,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 func TestBindingServiceBindAgentNameCreatesAgentBinding(t *testing.T) {
@@ -434,4 +435,95 @@ func TestHandleOutboundAgentBoundWithoutResolverFails(t *testing.T) {
 	if len(adapter.publishs) != 0 {
 		t.Fatalf("publishes = %d, want 0", len(adapter.publishs))
 	}
+}
+
+// TestBindingServiceListBySessionFindsAgentNameBinding is the regression
+// test for gc-idi3u5 (2026-09-12): `gc slack publish` (and anything else
+// resolving "my own binding" by session id) reported "no active extmsg
+// binding" for a conversation that `gc slack bind-dm <chan> mayor` had just
+// bound successfully. Root cause: ListBySession queried only the
+// session-id label, but an agent-name bind (Bind's other targeting mode --
+// its live session resolves at delivery time, not at bind time) is labeled
+// by agent name instead, so a session running under that agent could never
+// find its own binding by looking up its own session id. Confirmed live
+// against a running city before this fix: POST .../extmsg/bind's conflict
+// check correctly reported "already bound to agent mayor" (it queries by
+// conversation, so it sees both label types) while GET
+// .../extmsg/bindings?session_id=<mayor's live session id> returned empty
+// in the same breath.
+func TestBindingServiceListBySessionFindsAgentNameBinding(t *testing.T) {
+	freezeTestClock(t)
+	messaging := beads.NewMemStore()
+	sessionsStore := beads.NewMemStore()
+	directory := session.NewStore(beads.SessionStore{Store: sessionsStore})
+	fabric, err := NewServicesWithSessionDirectory(messaging, directory)
+	if err != nil {
+		t.Fatalf("NewServicesWithSessionDirectory: %v", err)
+	}
+	svc := fabric.Bindings
+	ref := testConversationRef()
+
+	sessionID := makeSessionBeadForAgent(t, sessionsStore, "gc-6mgr0", "mayor")
+
+	bound, err := svc.Bind(context.Background(), testControllerCaller(), BindInput{
+		Conversation: ref,
+		AgentName:    "mayor",
+		Now:          testNow(),
+	})
+	if err != nil {
+		t.Fatalf("Bind(agent): %v", err)
+	}
+
+	got, err := svc.ListBySession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("ListBySession(%s): %v", sessionID, err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ListBySession(%s) len = %d, want 1 (%#v)", sessionID, len(got), got)
+	}
+	if got[0].ID != bound.ID {
+		t.Fatalf("ListBySession(%s) binding ID = %s, want %s", sessionID, got[0].ID, bound.ID)
+	}
+	if got[0].AgentName != "mayor" {
+		t.Fatalf("ListBySession(%s) AgentName = %q, want mayor", sessionID, got[0].AgentName)
+	}
+
+	// A session running under a DIFFERENT agent must not see it.
+	otherSessionID := makeSessionBeadForAgent(t, sessionsStore, "gc-other", "not-mayor")
+	got, err = svc.ListBySession(context.Background(), otherSessionID)
+	if err != nil {
+		t.Fatalf("ListBySession(%s): %v", otherSessionID, err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ListBySession(%s) = %#v, want none (different agent)", otherSessionID, got)
+	}
+
+	// A session with no agent_name at all -- the common, non-agent case --
+	// must not error and must not see the agent binding either.
+	plainSessionID := makeSessionBead(t, sessionsStore, "gc-plain")
+	got, err = svc.ListBySession(context.Background(), plainSessionID)
+	if err != nil {
+		t.Fatalf("ListBySession(%s): %v", plainSessionID, err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ListBySession(%s) = %#v, want none (no agent_name)", plainSessionID, got)
+	}
+}
+
+// makeSessionBeadForAgent is makeSessionBead plus agent_name metadata, so
+// session.AddressDirectory.ResolveAddress resolves the returned session id
+// to an Info carrying that agent identity -- the case ListBySession's
+// agent-name lookup pass depends on.
+func makeSessionBeadForAgent(t *testing.T, store beads.Store, name, agentName string) string {
+	t.Helper()
+	b, err := store.Create(beads.Bead{
+		Title:    "session " + name,
+		Type:     session.BeadType,
+		Labels:   []string{session.LabelSession},
+		Metadata: map[string]string{"session_name": name, "agent_name": agentName},
+	})
+	if err != nil {
+		t.Fatalf("create session bead %q (agent %q): %v", name, agentName, err)
+	}
+	return b.ID
 }
