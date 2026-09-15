@@ -59,6 +59,39 @@ type selectiveUpdateFailStore struct {
 	beads.Store
 }
 
+// wispRootGetFailStore captures the ID dispatchWisp labels with "order-run:"
+// (i.e. the wisp root) from its Update call, then makes Get calls for that
+// specific ID fail failCount times before falling through to the real store —
+// simulating molecule.Instantiate and the label Update both reporting success
+// while the root is not yet (or never) readable back, per gc-edm4f. failCount
+// <= 0 fails Get for the root unconditionally.
+type wispRootGetFailStore struct {
+	beads.Store
+
+	failCount int
+	rootID    string
+	getCalls  int
+}
+
+func (s *wispRootGetFailStore) Update(id string, opts beads.UpdateOpts) error {
+	for _, label := range opts.Labels {
+		if strings.HasPrefix(label, "order-run:") {
+			s.rootID = id
+		}
+	}
+	return s.Store.Update(id, opts)
+}
+
+func (s *wispRootGetFailStore) Get(id string) (beads.Bead, error) {
+	if id != "" && id == s.rootID {
+		s.getCalls++
+		if s.failCount <= 0 || s.getCalls <= s.failCount {
+			return beads.Bead{}, beads.ErrNotFound
+		}
+	}
+	return s.Store.Get(id)
+}
+
 type execLabelUpdateFailStore struct {
 	beads.Store
 }
@@ -2596,6 +2629,147 @@ func TestOrderDispatchFormulaLabelFailureLabelsTrackingBead(t *testing.T) {
 	}
 	if !rec.hasType(events.OrderFailed) {
 		t.Error("missing order.failed event")
+	}
+}
+
+// trackingBeadFor returns the tracking bead among beads sharing an
+// order-run label (its title is "order:<scoped>", unlike the workflow
+// root/steps it tracks).
+func trackingBeadFor(t *testing.T, all []beads.Bead) beads.Bead {
+	t.Helper()
+	for _, b := range all {
+		if strings.HasPrefix(b.Title, "order:") {
+			return b
+		}
+	}
+	t.Fatalf("no tracking bead found; beads = %+v", all)
+	return beads.Bead{}
+}
+
+// TestOrderDispatchWispRootUnverifiedMarksTrackingBeadFailed pins the
+// gc-edm4f fix: when the just-instantiated wisp root cannot be read back from
+// graphStore even after Instantiate and the label Update both report success,
+// dispatchWisp must report the run as failed — with a marker that
+// distinguishes "root never became visible" from an ordinary instantiate
+// error — rather than the silent RunOutcomeWisp success that let
+// daily-introspect-city produce zero workflow roots on 4 of 7 days while
+// reporting clean success every time.
+func TestOrderDispatchWispRootUnverifiedMarksTrackingBeadFailed(t *testing.T) {
+	prevAttempts, prevDelay := orderWispVerifyAttempts, orderWispVerifyDelay
+	orderWispVerifyAttempts, orderWispVerifyDelay = 2, time.Millisecond
+	defer func() { orderWispVerifyAttempts, orderWispVerifyDelay = prevAttempts, prevDelay }()
+
+	store := &wispRootGetFailStore{Store: beads.NewMemStore()}
+	var rec memRecorder
+	var stderr bytes.Buffer
+
+	aa := []orders.Order{{
+		Name:         "unverified-root",
+		Trigger:      "cooldown",
+		Interval:     "2m",
+		Formula:      "test-formula",
+		FormulaLayer: sharedTestFormulaDir,
+	}}
+	ad := buildOrderDispatcherFromList(aa, store, nil)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+
+	mad := ad.(*memoryOrderDispatcher)
+	mad.rec = &rec
+	mad.stderr = &stderr
+
+	ad.dispatch(context.Background(), t.TempDir(), time.Now())
+	ad.drain(context.Background())
+
+	if store.rootID == "" {
+		t.Fatal("wisp root was never labeled; test fixture did not exercise the success path")
+	}
+
+	tracking := trackingBeadFor(t, trackingBeads(t, store, "order-run:unverified-root"))
+	hasWisp, hasFailed := false, false
+	for _, l := range tracking.Labels {
+		switch l {
+		case "wisp":
+			hasWisp = true
+		case "wisp-failed":
+			hasFailed = true
+		}
+	}
+	if !hasWisp || !hasFailed {
+		t.Errorf("tracking bead labels = %v, want {wisp, wisp-failed}", tracking.Labels)
+	}
+	if got := tracking.Metadata[beadmeta.FailureClassMetadataKey]; got != beadmeta.FailureClassHard {
+		t.Errorf("tracking bead gc.failure_class = %q, want %q", got, beadmeta.FailureClassHard)
+	}
+	if got := tracking.Metadata[beadmeta.FailureReasonMetadataKey]; got != "wisp_root_unverified" {
+		t.Errorf("tracking bead gc.failure_reason = %q, want wisp_root_unverified", got)
+	}
+	if got := tracking.Metadata[beadmeta.MissingRootBeadIDMetadataKey]; got != store.rootID {
+		t.Errorf("tracking bead gc.missing_root_bead_id = %q, want %q", got, store.rootID)
+	}
+	if !rec.hasType(events.OrderFailed) {
+		t.Error("missing order.failed event")
+	}
+	if rec.hasType(events.OrderCompleted) {
+		t.Error("unexpected order.completed event for an unverified root")
+	}
+}
+
+// TestOrderDispatchWispRootVerifiedAfterTransientReadFailure proves the
+// gc-edm4f readback retries rather than failing on the first transient miss:
+// a root that fails Get once but is readable on the very next attempt must
+// still report the dispatch as a clean success.
+func TestOrderDispatchWispRootVerifiedAfterTransientReadFailure(t *testing.T) {
+	prevAttempts, prevDelay := orderWispVerifyAttempts, orderWispVerifyDelay
+	orderWispVerifyAttempts, orderWispVerifyDelay = 3, time.Millisecond
+	defer func() { orderWispVerifyAttempts, orderWispVerifyDelay = prevAttempts, prevDelay }()
+
+	store := &wispRootGetFailStore{Store: beads.NewMemStore(), failCount: 1}
+	var rec memRecorder
+	var stderr bytes.Buffer
+
+	aa := []orders.Order{{
+		Name:         "transient-root",
+		Trigger:      "cooldown",
+		Interval:     "2m",
+		Formula:      "test-formula",
+		FormulaLayer: sharedTestFormulaDir,
+	}}
+	ad := buildOrderDispatcherFromList(aa, store, nil)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+
+	mad := ad.(*memoryOrderDispatcher)
+	mad.rec = &rec
+	mad.stderr = &stderr
+
+	ad.dispatch(context.Background(), t.TempDir(), time.Now())
+	ad.drain(context.Background())
+
+	if store.rootID == "" {
+		t.Fatal("wisp root was never labeled; test fixture did not exercise the success path")
+	}
+	if store.getCalls < 2 {
+		t.Fatalf("Get(rootID) called %d time(s), want at least 2 (one failure then a retry)", store.getCalls)
+	}
+
+	tracking := trackingBeadFor(t, trackingBeads(t, store, "order-run:transient-root"))
+	hasFailed := false
+	for _, l := range tracking.Labels {
+		if l == "wisp-failed" {
+			hasFailed = true
+		}
+	}
+	if hasFailed {
+		t.Errorf("tracking bead labels = %v, want no wisp-failed after a transient miss the retry recovers from", tracking.Labels)
+	}
+	if got := tracking.Metadata[beadmeta.FailureReasonMetadataKey]; got != "" {
+		t.Errorf("tracking bead gc.failure_reason = %q, want unset after a recovered transient miss", got)
+	}
+	if !rec.hasType(events.OrderCompleted) {
+		t.Error("missing order.completed event for a root the retry successfully verified")
 	}
 }
 

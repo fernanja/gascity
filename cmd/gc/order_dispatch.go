@@ -2123,6 +2123,28 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 		return
 	}
 
+	// gc-edm4f: Instantiate and the label Update above can both report success
+	// while the root they just wrote is not actually readable back from
+	// graphStore — daily-introspect-city silently produced zero workflow roots
+	// on 4 of 7 days this way, with every write in this function returning nil
+	// and no OrderFailed event anywhere to show for it.
+	// (CachingStore.refreshGraphAppliedBeads already runs a post-write readback
+	// and marks the cache entry dirty when that fails, but today that signal is
+	// only a rate-limited log line — no caller ever sees it as an error.) Read
+	// the root back before declaring the dispatch complete so this gap fails
+	// visibly instead of silently.
+	if verifyErr := verifyWispRootMaterialized(ctx, graphStore, rootID); verifyErr != nil {
+		logDispatchError(m.stderr, "gc: order %s: wisp %s created but not durably visible: %v", scoped, rootID, verifyErr)
+		m.rec.Record(events.Event{
+			Type:    events.OrderFailed,
+			Actor:   "controller",
+			Subject: scoped,
+			Message: fmt.Sprintf("wisp %s created but not durably visible: %v", rootID, verifyErr),
+		})
+		m.markWispRootUnverified(store, trackingID, scoped, a, headSeq, rootID)
+		return
+	}
+
 	m.rec.Record(events.Event{
 		Type:    events.OrderCompleted,
 		Actor:   "controller",
@@ -2161,6 +2183,30 @@ func (m *memoryOrderDispatcher) markTrackingFailure(store beads.Store, trackingI
 	front := m.orderFrontDoorFor(store)
 	if err := front.MarkFailed(trackingID, scoped, orders.RunOutcomeWispFailed, cursor); err != nil {
 		logDispatchError(m.stderr, "gc: order %s: failed to mark tracking bead %s as failed: %v", scoped, trackingID, err)
+	}
+}
+
+// markWispRootUnverified closes the tracking bead the same way
+// markTrackingFailure does (RunOutcomeWispFailed: labels {wisp, wisp-failed}),
+// then additionally stamps the generic engine failure vocabulary —
+// gc.failure_class, gc.failure_reason, gc.missing_root_bead_id — that
+// internal/dispatch/runtime.go already uses for an orphaned control bead
+// pointing at a since-vanished root. Without this, a wisp that was created but
+// never became durably visible is byte-identical to an ordinary instantiate
+// error: both collapse into the same {wisp, wisp-failed} label pair, and
+// order-health-audit / the mayor have no way to tell "the formula failed"
+// apart from "the graph store silently lost the write" (gc-edm4f).
+func (m *memoryOrderDispatcher) markWispRootUnverified(store beads.Store, trackingID, scoped string, a orders.Order, headSeq uint64, rootID string) {
+	m.markTrackingFailure(store, trackingID, scoped, a, headSeq)
+	metaErr := m.ordersStoreFor(store).Update(trackingID, beads.UpdateOpts{
+		Metadata: map[string]string{
+			beadmeta.FailureClassMetadataKey:      beadmeta.FailureClassHard,
+			beadmeta.FailureReasonMetadataKey:     "wisp_root_unverified",
+			beadmeta.MissingRootBeadIDMetadataKey: rootID,
+		},
+	})
+	if metaErr != nil {
+		logDispatchError(m.stderr, "gc: order %s: failed to stamp unverified-root metadata on tracking bead %s: %v", scoped, trackingID, metaErr)
 	}
 }
 
@@ -2509,6 +2555,45 @@ var orderGateBackoffDuration = 24 * time.Second
 // orderGateBackoffDuration) because this call site is not preceded by a
 // blocking gate read, so no real-time drift from tick-start has occurred yet.
 var orderWispMaterializationGrace = 20 * time.Second
+
+// orderWispVerifyAttempts/orderWispVerifyDelay bound the readback
+// verifyWispRootMaterialized performs, right before dispatchWisp declares an
+// order dispatch successful, to confirm the just-instantiated root is actually
+// durably visible in graphStore (gc-edm4f). Both molecule.Instantiate and the
+// label Update immediately preceding the readback can return nil while the
+// write never lands: CachingStore.refreshGraphAppliedBeads already runs a
+// post-write readback of its own and marks the cache entry dirty when that
+// fails, but that signal today is only a rate-limited log line, never an error
+// any caller sees. A short bounded retry tolerates a genuinely transient blip
+// without turning dispatch into a long-blocking or unbounded retry loop —
+// exhausting it is a hard, visible failure, never silent success.
+var orderWispVerifyAttempts = 3
+var orderWispVerifyDelay = 500 * time.Millisecond
+
+// verifyWispRootMaterialized reads rootID back from store, retrying up to
+// orderWispVerifyAttempts times (orderWispVerifyDelay apart) before giving up.
+// Returns nil the moment a read succeeds; otherwise returns the last read
+// error, or ctx's error if ctx is canceled while waiting between attempts.
+func verifyWispRootMaterialized(ctx context.Context, store beads.Store, rootID string) error {
+	var lastErr error
+	for attempt := 1; attempt <= orderWispVerifyAttempts; attempt++ {
+		_, err := store.Get(rootID)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt < orderWispVerifyAttempts {
+			timer := time.NewTimer(orderWispVerifyDelay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return fmt.Errorf("root bead %s not durably visible after %d attempt(s): %w", rootID, orderWispVerifyAttempts, lastErr)
+}
 
 // errGateTimeout marks an open-work gate error caused by the per-order
 // bound elapsing (the #2893 contention case), as opposed to ctx cancel or a
