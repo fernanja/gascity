@@ -12,6 +12,7 @@ import (
 	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/builtinpacks"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/doctor"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/hooks"
@@ -348,6 +349,7 @@ func doRigAddWithResult(fs fsys.FS, cityPath, rigPath string, includes []string,
 						fmt.Fprintf(stderr, "gc rig add: resolving formulas: %v\n", rfErr) //nolint:errcheck // best-effort stderr
 					}
 				}
+				warnMissingControlGateScripts(stderr, reloadedCfg, cityPath, config.Rig{Name: name, Path: rigPath})
 			}
 
 			if err := writeBeadsEnvGTRoot(fs, rigPath, cityPath); err != nil {
@@ -384,6 +386,46 @@ func doRigAddWithResult(fs fsys.FS, cityPath, rigPath string, includes []string,
 		return config.Rig{}, 1
 	}
 	return r, 0
+}
+
+// warnMissingControlGateScripts runs the control-gate-scripts doctor check
+// scoped to a single freshly provisioned rig (plus city-level formula
+// layers, which the check always includes) and prints a non-fatal warning
+// for any ralph-check gate script the rig's active formulas declare but
+// that does not yet exist as an executable regular file.
+//
+// Why: rig provisioning only eagerly materializes bundled-source pack
+// imports (see ensureBundledRigImportsInstalled) before returning; a rig
+// whose check scripts come from a non-bundled pack source can go live
+// before .gc/scripts/checks/ is actually populated. Previously that gap
+// was only discovered at dispatch time, when a control-dispatched bead's
+// ralph check hard-quarantined against the missing script -- 15 wasted
+// quarantine cycles on formula-flow, 2026-08-24/25 (gc-rucsm). The
+// dispatcher itself now retries a bare ENOENT instead of hard-quarantining
+// (gc-3gimnj, commit 33ca888e1), and `gc doctor` can already catch this
+// on demand (control-gate-scripts, same commit) -- this closes the
+// remaining gap by surfacing the same signal immediately at `gc rig add`
+// time, before the rig has a chance to accept any control-dispatched work.
+//
+// This is deliberately a warning, not a hard failure: a rig can be added
+// with its pack materialization still pending (see the Deferred handling
+// just above) or with no ralph-gated formulas mapped to it at all, and
+// neither is an error.
+func warnMissingControlGateScripts(stderr io.Writer, cfg *config.City, cityPath string, newRig config.Rig) {
+	if cfg == nil || strings.TrimSpace(newRig.Path) == "" {
+		return
+	}
+	result := doctor.NewControlGateScriptsCheck(cfg, cityPath, []config.Rig{newRig}).Run(nil)
+	if result.Status == doctor.StatusOK {
+		return
+	}
+	fmt.Fprintf(stderr, "gc rig add: warning: %s\n", result.Message) //nolint:errcheck // best-effort stderr
+	for _, detail := range result.Details {
+		fmt.Fprintf(stderr, "gc rig add: warning:   %s\n", detail) //nolint:errcheck // best-effort stderr
+	}
+	if result.FixHint != "" {
+		fmt.Fprintf(stderr, "gc rig add: warning: %s\n", result.FixHint) //nolint:errcheck // best-effort stderr
+	}
 }
 
 // The following one-line aliases keep cmd/gc test files compiling against the
