@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 )
 
 // countingBackingStore wraps a Store and counts SetMetadata /
@@ -1286,5 +1287,218 @@ func TestCachingStoreCloseKeepsCachedSynthesisWhenRefreshFails(t *testing.T) {
 	}
 	if got.Status != "closed" {
 		t.Fatalf("cached status after Close with failed refresh = %q, want %q (synthesis fallback)", got.Status, "closed")
+	}
+}
+
+// flakyGetStore wraps a Store and makes Get return ErrNotFound for a
+// configurable number of upcoming calls per id before falling through to the
+// real backing. Simulates a same-process readback racing backing
+// commit-visibility immediately after a write that itself already returned
+// success (gc-hh12o).
+type flakyGetStore struct {
+	Store
+	failRemaining map[string]int
+	getCalls      map[string]int
+}
+
+func newFlakyGetStore(backing Store) *flakyGetStore {
+	return &flakyGetStore{Store: backing, failRemaining: make(map[string]int), getCalls: make(map[string]int)}
+}
+
+func (s *flakyGetStore) failNextGets(id string, n int) {
+	s.failRemaining[id] = n
+}
+
+func (s *flakyGetStore) Get(id string) (Bead, error) {
+	s.getCalls[id]++
+	if s.failRemaining[id] > 0 {
+		s.failRemaining[id]--
+		return Bead{}, ErrNotFound
+	}
+	return s.Store.Get(id)
+}
+
+func withNoReadbackSleep(t *testing.T) {
+	t.Helper()
+	prev := cachingStoreReadbackSleep
+	cachingStoreReadbackSleep = func(time.Duration) {}
+	t.Cleanup(func() { cachingStoreReadbackSleep = prev })
+}
+
+func TestCachingStoreUpdateSelfHealsTransientReadbackNotFound(t *testing.T) {
+	t.Parallel()
+	withNoReadbackSleep(t)
+
+	backing := newFlakyGetStore(NewMemStore())
+	bead, err := backing.Create(Bead{Title: "task"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	cache := NewCachingStoreForTest(backing, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	// One transient miss, then a real read succeeds -- must self-heal via
+	// retry instead of immediately falling into the "concurrent delete"
+	// tombstone path a single ErrNotFound used to trigger unconditionally.
+	backing.failNextGets(bead.ID, 1)
+	title := "updated via retry"
+	if err := cache.Update(bead.ID, UpdateOpts{Title: &title}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	if got := backing.getCalls[bead.ID]; got != 2 {
+		t.Fatalf("backing Get calls for %s = %d, want 2 (1 miss + 1 retry that succeeds)", bead.ID, got)
+	}
+
+	cache.mu.RLock()
+	_, dirty := cache.dirty[bead.ID]
+	cached, inBeads := cache.beads[bead.ID]
+	cache.mu.RUnlock()
+	if dirty {
+		t.Fatal("bead marked dirty after a transient readback the retry recovered from")
+	}
+	if !inBeads {
+		t.Fatal("bead evicted from cache after a transient readback the retry recovered from")
+	}
+	if cached.Title != title {
+		t.Fatalf("cached title = %q, want %q (authoritative backing state via retried Get)", cached.Title, title)
+	}
+}
+
+func TestCachingStoreUpdatePersistentNotFoundStillTombstones(t *testing.T) {
+	t.Parallel()
+	withNoReadbackSleep(t)
+
+	backing := newFlakyGetStore(NewMemStore())
+	bead, err := backing.Create(Bead{Title: "task"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	cache := NewCachingStoreForTest(backing, nil)
+	if err := cache.Prime(context.Background()); err != nil {
+		t.Fatalf("Prime: %v", err)
+	}
+
+	// Every attempt misses -- must exhaust retries and fall through to the
+	// existing "concurrent delete" tombstone fallback, unchanged by this fix.
+	backing.failNextGets(bead.ID, cachingStoreReadbackAttempts)
+	title := "should not stick"
+	if err := cache.Update(bead.ID, UpdateOpts{Title: &title}); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	if got := backing.getCalls[bead.ID]; got != cachingStoreReadbackAttempts {
+		t.Fatalf("backing Get calls for %s = %d, want %d (retries exhausted)", bead.ID, got, cachingStoreReadbackAttempts)
+	}
+
+	cache.mu.RLock()
+	_, inBeads := cache.beads[bead.ID]
+	cache.mu.RUnlock()
+	if inBeads {
+		t.Fatal("bead still cached after persistent readback failure; want tombstone eviction (unchanged fallback)")
+	}
+}
+
+// flakyGetGraphApplyStore composes graph-apply support (via the embedded
+// concrete *storageGraphApplyRecordingStore, whose Create/ApplyGraphPlan
+// methods are promoted through) with a flaky Get, so ApplyGraphPlan's own
+// write path is untouched while its post-apply cache-refresh Get can be made
+// to miss on demand.
+type flakyGetGraphApplyStore struct {
+	*storageGraphApplyRecordingStore
+	failRemaining int
+	getCalls      int
+}
+
+func newFlakyGetGraphApplyStore(backing Store) *flakyGetGraphApplyStore {
+	return &flakyGetGraphApplyStore{storageGraphApplyRecordingStore: &storageGraphApplyRecordingStore{Store: backing}}
+}
+
+func (s *flakyGetGraphApplyStore) failNextGets(n int) {
+	s.failRemaining = n
+}
+
+func (s *flakyGetGraphApplyStore) Get(id string) (Bead, error) {
+	s.getCalls++
+	if s.failRemaining > 0 {
+		s.failRemaining--
+		return Bead{}, ErrNotFound
+	}
+	return s.storageGraphApplyRecordingStore.Get(id)
+}
+
+func TestCachingStoreApplyGraphPlanSelfHealsTransientReadbackNotFound(t *testing.T) {
+	t.Parallel()
+	withNoReadbackSleep(t)
+
+	backing := newFlakyGetGraphApplyStore(NewMemStore())
+	cache := NewCachingStoreForTest(backing, nil)
+	applier, ok := GraphApplyFor(cache)
+	if !ok {
+		t.Fatal("GraphApplyFor(cache) = false, want graph handle")
+	}
+
+	backing.failNextGets(1)
+	result, err := applier.ApplyGraphPlan(context.Background(), &GraphApplyPlan{
+		Nodes: []GraphApplyNode{{Key: "root", Title: "Root"}},
+	})
+	if err != nil {
+		t.Fatalf("ApplyGraphPlan: %v", err)
+	}
+	id := result.IDs["root"]
+
+	if backing.getCalls != 2 {
+		t.Fatalf("backing Get calls = %d, want 2 (1 miss + 1 retry that succeeds)", backing.getCalls)
+	}
+
+	cache.mu.RLock()
+	_, dirty := cache.dirty[id]
+	_, inBeads := cache.beads[id]
+	cache.mu.RUnlock()
+	if dirty {
+		t.Fatal("graph-applied bead marked dirty after a transient readback the retry recovered from")
+	}
+	if !inBeads {
+		t.Fatal("graph-applied bead missing from cache after a transient readback the retry recovered from")
+	}
+}
+
+func TestCachingStoreApplyGraphPlanPersistentNotFoundStaysDirty(t *testing.T) {
+	t.Parallel()
+	withNoReadbackSleep(t)
+
+	backing := newFlakyGetGraphApplyStore(NewMemStore())
+	cache := NewCachingStoreForTest(backing, nil)
+	applier, ok := GraphApplyFor(cache)
+	if !ok {
+		t.Fatal("GraphApplyFor(cache) = false, want graph handle")
+	}
+
+	backing.failNextGets(cachingStoreReadbackAttempts)
+	result, err := applier.ApplyGraphPlan(context.Background(), &GraphApplyPlan{
+		Nodes: []GraphApplyNode{{Key: "root", Title: "Root"}},
+	})
+	// ApplyGraphPlan's own return contract is unchanged by this fix: the
+	// backing write already succeeded, so an exhausted refresh-Get still
+	// doesn't surface as an error here -- that contract change is explicitly
+	// out of scope (see gc-hh12o).
+	if err != nil {
+		t.Fatalf("ApplyGraphPlan: %v", err)
+	}
+	id := result.IDs["root"]
+
+	if backing.getCalls != cachingStoreReadbackAttempts {
+		t.Fatalf("backing Get calls = %d, want %d (retries exhausted)", backing.getCalls, cachingStoreReadbackAttempts)
+	}
+
+	cache.mu.RLock()
+	_, dirty := cache.dirty[id]
+	cache.mu.RUnlock()
+	if !dirty {
+		t.Fatal("graph-applied bead not marked dirty after persistent readback failure; want unchanged dirty-mark fallback")
 	}
 }

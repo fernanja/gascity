@@ -6,6 +6,26 @@ import (
 	"time"
 )
 
+const (
+	// cachingStoreReadbackAttempts bounds retries of the post-write readback
+	// Get that CachingStore issues right after a backing write already
+	// reported success (Update, and refreshBeadAfterWrite's callers:
+	// ApplyGraphPlan's cache warm, SetMetadata(Batch), ReleaseIfCurrent,
+	// DepAdd/DepRemove). Matches bdTransientReadAttempts/bdTransientWriteAttempts.
+	cachingStoreReadbackAttempts = 3
+	// cachingStoreReadbackBackoffUnit scales linearly with attempt number
+	// (attempt * unit), same shape as runBDTransientWriteOutputWhen's 25ms
+	// unit. Kept small because this fires inline on every CachingStore write,
+	// not just the rare order-dispatch path gc-edm4f's verifyWispRootMaterialized
+	// covers -- worst case with 3 attempts is 40ms+80ms=120ms of added latency,
+	// and only on the already-abnormal path where the first readback missed.
+	cachingStoreReadbackBackoffUnit = 40 * time.Millisecond
+)
+
+// cachingStoreReadbackSleep is the backoff seam for getAfterWriteWithRetry,
+// overridable in tests. Mirrors conditionalWriteSleep in bdstore_conditional.go.
+var cachingStoreReadbackSleep = func(d time.Duration) { time.Sleep(d) }
+
 // Create passes through to the backing store and updates the cache.
 func (c *CachingStore) Create(b Bead) (Bead, error) {
 	return c.createWith(func() (Bead, error) {
@@ -68,7 +88,7 @@ func (c *CachingStore) Update(id string, opts UpdateOpts) error {
 	}
 
 	// Re-fetch from backing to get the authoritative state.
-	fresh, err := c.backing.Get(id)
+	fresh, err := c.getAfterWriteWithRetry(id)
 	if err != nil {
 		c.mu.Lock()
 		seq := c.noteLocalMutationLocked(id)
@@ -488,12 +508,44 @@ func (c *CachingStore) GetLocalString(id, key string) (string, error) {
 }
 
 func (c *CachingStore) refreshBeadAfterWrite(id, op string) (Bead, bool) {
-	fresh, err := c.backing.Get(id)
+	fresh, err := c.getAfterWriteWithRetry(id)
 	if err != nil {
 		c.recordProblem(op, fmt.Errorf("%s: %w", id, err))
 		return Bead{}, false
 	}
 	return fresh, true
+}
+
+// getAfterWriteWithRetry re-reads id from backing immediately after a write
+// that itself already returned success. Callers use the read purely to warm
+// the cache with authoritative state (or, for Update, to detect a concurrent
+// delete) -- the write is already durable by the time this runs. A same-process
+// readback can still occasionally miss a write it's racing against backing
+// commit-visibility (gc-hh12o: CachingStore.refreshGraphAppliedBeads and
+// CachingStore.Update both saw this immediately after ApplyGraphPlan/Update
+// calls that returned nil). Retrying a bounded number of times on ErrNotFound
+// only lets that lag resolve itself, the same mechanism proven effective for
+// the sibling order-dispatch case (verifyWispRootMaterialized, gc-edm4f).
+//
+// This does NOT change what happens when the readback still fails after every
+// attempt: callers keep their existing fallback (tombstone-as-deleted for
+// Update, mark-dirty-for-next-real-read elsewhere). Whether a persistent
+// failure should instead surface as an error from the write call itself is a
+// separate, deliberately unmade decision -- it would change return-value
+// semantics for every ApplyGraphPlan/Update/SetMetadata/DepAdd/... caller in
+// the engine, and needs its own audit of which callers assume a nil error
+// means "durably done" before it's safe to change (see gc-hh12o).
+func (c *CachingStore) getAfterWriteWithRetry(id string) (Bead, error) {
+	var fresh Bead
+	var err error
+	for attempt := 1; attempt <= cachingStoreReadbackAttempts; attempt++ {
+		fresh, err = c.backing.Get(id)
+		if err == nil || !errors.Is(err, ErrNotFound) || attempt == cachingStoreReadbackAttempts {
+			return fresh, err
+		}
+		cachingStoreReadbackSleep(time.Duration(attempt) * cachingStoreReadbackBackoffUnit)
+	}
+	return fresh, err
 }
 
 func (c *CachingStore) refreshBeadWithDepsAfterWrite(id, op string) (Bead, []Dep, bool) {
