@@ -62,17 +62,32 @@ title = "Inspect {{convoy_id}}"
 	if created.Type != "convoy" {
 		t.Fatalf("input convoy type = %q, want convoy", created.Type)
 	}
-	wantMetadata := map[string]string{"gc.synthetic": "true"}
+	wantMetadata := map[string]string{
+		"gc.synthetic":       "true",
+		"gc.idempotency_key": DispatchIdempotencyKey(target.ID, "work", nil),
+	}
 	if !maps.Equal(created.Metadata, wantMetadata) {
 		t.Fatalf("input convoy metadata = %+v, want %+v", created.Metadata, wantMetadata)
 	}
 
+	// A repeated invocation for the same (target, formula, vars) is a dispatch
+	// RETRY, not a new dispatch: it must reuse the open input convoy instead of
+	// minting a duplicate (gc-wnjjc — retried dispatches over Dolt contention
+	// created duplicate input convoys and, once, a full duplicate workflow root,
+	// because a fresh convoy ID changes the RootKey the root singleton dedupes on).
 	again, err := PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, nil)
 	if err != nil {
 		t.Fatalf("PrepareInvocation again: %v", err)
 	}
-	if again.InputConvoy == inv.InputConvoy {
-		t.Fatalf("input convoy was reused: first=%s second=%s", inv.InputConvoy, again.InputConvoy)
+	if again.InputConvoy != inv.InputConvoy {
+		t.Fatalf("retried invocation minted a duplicate input convoy: first=%s second=%s", inv.InputConvoy, again.InputConvoy)
+	}
+	convoys, err := store.List(beads.ListQuery{Type: "convoy"})
+	if err != nil {
+		t.Fatalf("List convoys: %v", err)
+	}
+	if len(convoys) != 1 {
+		t.Fatalf("open input convoys after retry = %d, want 1 (%+v)", len(convoys), convoys)
 	}
 }
 
@@ -1148,5 +1163,208 @@ func TestSyntheticInputConvoyIsWorkClassAndCoResidentWithItsTarget(t *testing.T)
 	}
 	if !tracked {
 		t.Fatalf("input convoy %s does not track target %s", convoyID, target.ID)
+	}
+}
+
+// TestDispatchIdempotencyKeyStability pins the dispatch key contract the
+// retry-duplication guard (gc-wnjjc) depends on: identical (target, formula,
+// normalized vars) yield the same key across attempts; reserved runtime vars
+// never perturb it; and any real identity change yields a distinct key.
+func TestDispatchIdempotencyKeyStability(t *testing.T) {
+	base := DispatchIdempotencyKey("gc-1", "build-from-plan", map[string]string{"plan_path": "p.md"})
+	if again := DispatchIdempotencyKey("gc-1", "build-from-plan", map[string]string{"plan_path": "p.md"}); again != base {
+		t.Fatalf("key not stable across attempts: %q vs %q", again, base)
+	}
+	withReserved := DispatchIdempotencyKey("gc-1", "build-from-plan", map[string]string{
+		"plan_path":     "p.md",
+		ConvoyIDVar:     "convoy-A",
+		LegacyIssueVar:  "gc-1",
+		legacyBeadIDVar: "gc-1",
+	})
+	if withReserved != base {
+		t.Fatalf("reserved vars changed the key: %q vs %q", withReserved, base)
+	}
+	if k := DispatchIdempotencyKey("gc-2", "build-from-plan", map[string]string{"plan_path": "p.md"}); k == base {
+		t.Fatalf("different target shares key %q", k)
+	}
+	if k := DispatchIdempotencyKey("gc-1", "build-basic", map[string]string{"plan_path": "p.md"}); k == base {
+		t.Fatalf("different formula shares key %q", k)
+	}
+	if k := DispatchIdempotencyKey("gc-1", "build-from-plan", map[string]string{"plan_path": "other.md"}); k == base {
+		t.Fatalf("different vars share key %q", k)
+	}
+}
+
+// TestPrepareInvocationRetryReusesConvoyLeftOpenByFailedAttempt covers the
+// observed duplicate-input-convoy incident shape (gc-wnjjc): attempt 1 mints
+// an input convoy and then fails AFTER the mint in a way that leaves the
+// convoy open (its best-effort close lost to Dolt contention). The retry must
+// converge on that stranded open convoy, not mint a second one beside it.
+func TestPrepareInvocationRetryReusesConvoyLeftOpenByFailedAttempt(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeFormula(t, dir, "work.formula.toml", `
+formula = "work"
+version = 1
+contract = "graph.v2"
+type = "workflow"
+
+[[steps]]
+id = "inspect"
+title = "Inspect {{convoy_id}}"
+`)
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+
+	first, err := PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, nil)
+	if err != nil {
+		t.Fatalf("PrepareInvocation: %v", err)
+	}
+	// Attempt 1 "failed" downstream and its CloseSyntheticInputConvoy was lost
+	// to contention: the convoy is still open. Nothing to simulate — the convoy
+	// IS open at this point; the retry is the interesting half.
+	retry, err := PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, nil)
+	if err != nil {
+		t.Fatalf("PrepareInvocation retry: %v", err)
+	}
+	if retry.InputConvoy != first.InputConvoy {
+		t.Fatalf("retry minted a second input convoy %s beside stranded %s", retry.InputConvoy, first.InputConvoy)
+	}
+	if got := retry.Vars[ConvoyIDVar]; got != first.InputConvoy {
+		t.Fatalf("retry vars[%s] = %q, want reused convoy %q", ConvoyIDVar, got, first.InputConvoy)
+	}
+}
+
+// TestPrepareInvocationRetryAfterClosedConvoyMintsFresh proves the reuse guard
+// never resurrects a CONSUMED input convoy: once the prior workflow finished
+// (its input convoy closed), a re-dispatch of the same bead is a genuinely new
+// dispatch and gets a fresh convoy.
+func TestPrepareInvocationRetryAfterClosedConvoyMintsFresh(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeFormula(t, dir, "work.formula.toml", `
+formula = "work"
+version = 1
+contract = "graph.v2"
+type = "workflow"
+
+[[steps]]
+id = "inspect"
+title = "Inspect {{convoy_id}}"
+`)
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+
+	first, err := PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, nil)
+	if err != nil {
+		t.Fatalf("PrepareInvocation: %v", err)
+	}
+	if err := store.Close(first.InputConvoy); err != nil {
+		t.Fatalf("Close first convoy: %v", err)
+	}
+
+	second, err := PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, nil)
+	if err != nil {
+		t.Fatalf("PrepareInvocation second: %v", err)
+	}
+	if second.InputConvoy == first.InputConvoy {
+		t.Fatalf("second dispatch resurrected closed convoy %s", first.InputConvoy)
+	}
+}
+
+// TestPrepareInvocationDistinctVarsMintDistinctConvoys proves the guard keys
+// on the normalized vars: same bead + formula with different effective vars is
+// a different dispatch identity, not a retry.
+func TestPrepareInvocationDistinctVarsMintDistinctConvoys(t *testing.T) {
+	formulatest.EnableV2ForTest(t)
+	dir := t.TempDir()
+	writeFormula(t, dir, "work.formula.toml", `
+formula = "work"
+version = 1
+contract = "graph.v2"
+type = "workflow"
+
+[vars]
+[vars.mode]
+default = "review"
+
+[[steps]]
+id = "inspect"
+title = "Inspect {{convoy_id}} in {{mode}}"
+`)
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+
+	review, err := PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, nil)
+	if err != nil {
+		t.Fatalf("PrepareInvocation (default vars): %v", err)
+	}
+	implement, err := PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, map[string]string{"mode": "implement"})
+	if err != nil {
+		t.Fatalf("PrepareInvocation (mode=implement): %v", err)
+	}
+	if implement.InputConvoy == review.InputConvoy {
+		t.Fatalf("distinct vars shared input convoy %s", review.InputConvoy)
+	}
+}
+
+// TestCloseSyntheticInputConvoySkipsConvoyConsumedByLiveRoot pins the reuse
+// guard's cleanup counterpart: with convoy reuse a FAILED retry can share its
+// input convoy with an already-launched live workflow root, and its failure
+// cleanup must not close that root's provenance link out from under it. Once
+// no live consumer remains, the close proceeds as before — and the consumer
+// itself (dispatch finalization passes the root as targetID) is never blocked
+// by its own reference.
+func TestCloseSyntheticInputConvoySkipsConvoyConsumedByLiveRoot(t *testing.T) {
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "target", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create target: %v", err)
+	}
+	convoy, err := CreateSingleItemInputConvoy(store, target)
+	if err != nil {
+		t.Fatalf("CreateSingleItemInputConvoy: %v", err)
+	}
+	root, err := store.Create(beads.Bead{
+		Title: "workflow root",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+			"gc.input_convoy_id":  convoy.ID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create root: %v", err)
+	}
+
+	// A failed retry's cleanup (targetID = the source bead) must skip the close.
+	CloseSyntheticInputConvoy(store, convoy.ID, target.ID)
+	got, err := store.Get(convoy.ID)
+	if err != nil {
+		t.Fatalf("Get convoy: %v", err)
+	}
+	if got.Status == "closed" {
+		t.Fatalf("cleanup closed input convoy %s while live root %s still consumes it", convoy.ID, root.ID)
+	}
+
+	// The consuming root's own finalization (targetID = the root) is not
+	// blocked by its own reference.
+	CloseSyntheticInputConvoy(store, convoy.ID, root.ID)
+	got, err = store.Get(convoy.ID)
+	if err != nil {
+		t.Fatalf("Get convoy after finalize close: %v", err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("finalization did not close convoy %s (status %s)", convoy.ID, got.Status)
 	}
 }

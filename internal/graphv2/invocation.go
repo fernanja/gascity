@@ -155,7 +155,7 @@ func PrepareInvocation(ctx context.Context, store beads.Store, formulaName strin
 	if store == nil {
 		return Invocation{}, fmt.Errorf("v2 formula %q requires a bead store to normalize target %s", formulaName, targetID)
 	}
-	convoyID, err := NormalizeInputConvoy(store, targetID)
+	convoyID, err := normalizeInputConvoy(store, targetID, DispatchIdempotencyKey(targetID, formulaName, inv.Vars))
 	if err != nil {
 		return Invocation{}, err
 	}
@@ -201,7 +201,40 @@ func CloseSyntheticInputConvoy(store beads.Store, convoyID, targetID string) {
 	if convoycore.IsTerminalStatus(b.Status) {
 		return
 	}
+	if convoyReferencedByOtherLiveBead(store, convoyID, targetID) {
+		// With dispatch-idempotent convoy reuse (gc-wnjjc) a failed retry can
+		// share its input convoy with an already-launched LIVE workflow root.
+		// Closing it here would strip that live workflow's provenance link
+		// mid-flight, so the close is skipped: an open convoy is sweepable
+		// debris, a closed input convoy under a live root is not recoverable.
+		return
+	}
 	_ = store.Close(convoyID) //nolint:errcheck // best-effort cleanup of this invocation's own artifact
+}
+
+// convoyReferencedByOtherLiveBead reports whether any live bead other than
+// excludeID references convoyID as its gc.input_convoy_id (i.e. a workflow
+// root still consuming this input convoy). excludeID lets a caller that IS the
+// consumer — dispatch runtime finalization passes the workflow root as
+// targetID — close its own convoy without being blocked by its own reference.
+// Fail-safe: a lookup error reports true so the caller skips the close.
+func convoyReferencedByOtherLiveBead(store beads.Store, convoyID, excludeID string) bool {
+	matches, err := store.List(beads.ListQuery{
+		Metadata: map[string]string{beadmeta.InputConvoyIDMetadataKey: convoyID},
+		Live:     true,
+	})
+	if err != nil {
+		return true
+	}
+	for _, b := range matches {
+		if b.ID == excludeID {
+			continue
+		}
+		if b.Status != "closed" {
+			return true
+		}
+	}
+	return false
 }
 
 // legacyIssueDeprecations formats deprecation warnings for legacy issue and
@@ -383,6 +416,31 @@ func ValidateNoReservedUserVars(vars map[string]string) error {
 // NormalizeInputConvoy returns targetID when it is already a convoy, otherwise
 // it creates a visible system-created one-item convoy tracking targetID.
 func NormalizeInputConvoy(store beads.Store, targetID string) (string, error) {
+	return normalizeInputConvoy(store, targetID, "")
+}
+
+// DispatchIdempotencyKey returns the stable dispatch-level idempotency key for
+// a targeted graph.v2 invocation: source bead + formula + normalized
+// (reserved-var-excluded, sorted, hashed) runtime vars. Two dispatch attempts
+// for the same work share one key, so a retried dispatch reuses the first
+// attempt's OPEN synthetic input convoy instead of minting a duplicate — which
+// also keeps RootKey identical across the attempts, letting the workflow-root
+// singleton (gc.graphv2_root_key lookup) dedupe the root itself. This is the
+// guard for the retry-duplication class where a dispatch retried over Dolt
+// contention created a second input convoy — and once a full second workflow
+// root — for the same source bead (gc-wnjjc); RootKey alone cannot catch it
+// because it keys on the (freshly minted, therefore different) convoy ID.
+func DispatchIdempotencyKey(targetID, formulaName string, vars map[string]string) string {
+	return "graphv2-dispatch:" + strings.TrimSpace(targetID) + ":" + strings.TrimSpace(formulaName) + ":" + varsFingerprint(vars)
+}
+
+// normalizeInputConvoy resolves the input convoy for a targeted invocation.
+// With a non-empty dispatchKey the synthetic-convoy mint is idempotent: an
+// existing OPEN synthetic input convoy stamped with the same key and tracking
+// the same target is reused instead of creating a second one. An empty
+// dispatchKey preserves the historical always-mint behavior for callers with
+// no dispatch identity.
+func normalizeInputConvoy(store beads.Store, targetID, dispatchKey string) (string, error) {
 	targetID = strings.TrimSpace(targetID)
 	if store == nil {
 		return "", fmt.Errorf("formulas v2 invocation requires a bead store")
@@ -403,11 +461,59 @@ func NormalizeInputConvoy(store beads.Store, targetID string) (string, error) {
 	if target.Type == "convoy" {
 		return target.ID, nil
 	}
-	inputConvoy, err := CreateSingleItemInputConvoy(store, target)
+	if dispatchKey != "" {
+		// Process-local serialization on the key (same posture as RootKey's
+		// LockKey prior art); cross-process retries converge through the
+		// lookup-before-create below, which closes the observed sequential
+		// retry-duplication window.
+		unlock := lockKey(dispatchKey)
+		defer unlock()
+		existingID, err := openInputConvoyForDispatchKey(store, dispatchKey, target.ID)
+		if err != nil {
+			return "", err
+		}
+		if existingID != "" {
+			return existingID, nil
+		}
+	}
+	inputConvoy, err := createSingleItemInputConvoy(store, target, dispatchKey)
 	if err != nil {
 		return "", err
 	}
 	return inputConvoy.ID, nil
+}
+
+// openInputConvoyForDispatchKey returns the ID of an existing OPEN synthetic
+// input convoy stamped with dispatchKey and tracking targetID, or "" when none
+// exists. Multiple matches (pre-fix duplicates) resolve deterministically to
+// the lowest ID so every retry converges on the same canonical convoy.
+func openInputConvoyForDispatchKey(store beads.Store, dispatchKey, targetID string) (string, error) {
+	matches, err := store.List(beads.ListQuery{
+		Metadata: map[string]string{beadmeta.IdempotencyKeyMetadataKey: dispatchKey},
+		Live:     true,
+	})
+	if err != nil {
+		return "", fmt.Errorf("looking up input convoys for dispatch key %s: %w", dispatchKey, err)
+	}
+	var candidates []string
+	for _, b := range matches {
+		if b.Type != "convoy" || b.Metadata[syntheticMetadataKey] != "true" || convoycore.IsTerminalStatus(b.Status) {
+			continue
+		}
+		tracked, err := convoycore.HasTrack(store, b.ID, targetID)
+		if err != nil || !tracked {
+			// A membership read error means this candidate cannot be PROVEN to
+			// track the target; skip it rather than adopting an unverified
+			// convoy (worst case a fresh one is minted — the pre-fix behavior).
+			continue
+		}
+		candidates = append(candidates, b.ID)
+	}
+	if len(candidates) == 0 {
+		return "", nil
+	}
+	sort.Strings(candidates)
+	return candidates[0], nil
 }
 
 // CreateSingleItemInputConvoy creates a system-created one-item convoy for a
@@ -424,6 +530,13 @@ func NormalizeInputConvoy(store beads.Store, targetID string) (string, error) {
 // remember: routing this at a graph binding would fail to find the target long
 // before it could mint a convoy in the wrong ledger.
 func CreateSingleItemInputConvoy(store beads.Store, target beads.Bead) (beads.Bead, error) {
+	return createSingleItemInputConvoy(store, target, "")
+}
+
+// createSingleItemInputConvoy mints the synthetic convoy, stamping the
+// dispatch idempotency key when the invocation carries one so a retried
+// dispatch can find and reuse this convoy (openInputConvoyForDispatchKey).
+func createSingleItemInputConvoy(store beads.Store, target beads.Bead, dispatchKey string) (beads.Bead, error) {
 	if store == nil {
 		return beads.Bead{}, fmt.Errorf("formulas v2 invocation requires a bead store")
 	}
@@ -435,6 +548,9 @@ func CreateSingleItemInputConvoy(store beads.Store, target beads.Bead) (beads.Be
 	}
 	metadata := map[string]string{
 		syntheticMetadataKey: "true",
+	}
+	if dispatchKey != "" {
+		metadata[beadmeta.IdempotencyKeyMetadataKey] = dispatchKey
 	}
 	created, err := store.Create(beads.Bead{
 		Title:    "input convoy for " + target.ID,

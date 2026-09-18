@@ -1084,7 +1084,15 @@ func runGitForFormulaTest(t *testing.T, dir string, args ...string) {
 	}
 }
 
-func TestFormulaCookAttachGraphV2CreatesFreshRootForBareBeadTarget(t *testing.T) {
+// TestFormulaCookAttachGraphV2IdenticalReattachConvergesOnLiveRoot pins the
+// dispatch idempotency guard (gc-wnjjc) on the `gc formula cook --attach`
+// surface. This test originally asserted that two identical attaches mint two
+// independent roots ("fresh convoy per pour"); in production that behavior let
+// a dispatch retried over Dolt contention duplicate the synthetic input convoy
+// and — because the graphv2 root key includes the convoy ID — launch a full
+// second live workflow root for the same source bead. Two identical cooks now
+// converge on ONE live root, with the convoy/root-key/dep/event wiring intact.
+func TestFormulaCookAttachGraphV2IdenticalReattachConvergesOnLiveRoot(t *testing.T) {
 	formulatest.EnableV2ForTest(t)
 	t.Setenv("GC_HOME", t.TempDir())
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
@@ -1147,8 +1155,8 @@ title = "Do work for {{convoy_id}}"
 	if err != nil {
 		t.Fatalf("list workflow roots: %v", err)
 	}
-	if len(roots) != 2 {
-		t.Fatalf("workflow roots = %+v, want two independent graph.v2 attach roots", roots)
+	if len(roots) != 1 {
+		t.Fatalf("workflow roots = %+v, want ONE root: an identical re-attach must converge on the live root, not mint a duplicate (gc-wnjjc)", roots)
 	}
 	for _, root := range roots {
 		if root.Metadata["gc.graphv2_root_key"] == "" {

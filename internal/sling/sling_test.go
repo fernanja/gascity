@@ -3132,7 +3132,18 @@ func TestInstantiateGraphFormulaPreservesMaterializationWhenProjectionFails(t *t
 	}
 }
 
-func TestSlingAttachGraphFormulaCreatesFreshRootForBareBeadTarget(t *testing.T) {
+// TestSlingAttachGraphFormulaIdenticalRedispatchConvergesOnLiveRoot pins the
+// dispatch idempotency guard for bare-bead targets (gc-wnjjc). This test
+// originally asserted the OPPOSITE — that an identical second dispatch mints a
+// fresh input convoy and a fresh live root (#2784's "fresh convoy per pour"
+// simplification). In production that behavior meant a dispatch retried over
+// Dolt contention duplicated the input convoy and, because the graphv2
+// RootKey keys on the convoy ID, escaped the root singleton and launched a
+// full second live workflow root for the same source bead. An identical
+// (bead, formula, vars) re-dispatch is now an idempotent convergence on the
+// existing live root; a genuinely new run still gets a fresh root once the
+// prior one is closed, and --force still replaces.
+func TestSlingAttachGraphFormulaIdenticalRedispatchConvergesOnLiveRoot(t *testing.T) {
 	formulaDir := t.TempDir()
 	writeGraphV2ConvoyFormula(t, formulaDir)
 	cfg := graphV2SlingTestConfig(t, formulaDir)
@@ -3154,8 +3165,8 @@ func TestSlingAttachGraphFormulaCreatesFreshRootForBareBeadTarget(t *testing.T) 
 	if err != nil {
 		t.Fatalf("second AttachFormula: %v", err)
 	}
-	if second.WorkflowID == first.WorkflowID {
-		t.Fatalf("WorkflowID = %q, want fresh root for fresh input convoy", second.WorkflowID)
+	if second.WorkflowID != first.WorkflowID {
+		t.Fatalf("identical re-dispatch launched a second root %q beside %q, want idempotent convergence", second.WorkflowID, first.WorkflowID)
 	}
 }
 
