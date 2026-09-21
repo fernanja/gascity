@@ -56,7 +56,10 @@ func poolClaimOps(runner string, claimedMeta map[string]string, branch string, s
 			return beads.Bead{ID: id, Status: "in_progress", Assignee: assignee, Metadata: claimedMeta}, true, nil
 		},
 		ResolveWorkBranch: func(string) string { return branch },
-		StampWorkMeta:     spy.fn,
+		// Hermetic default-branch seam for the stamp guard (gc-yllis): matches
+		// the production fallback without shelling out to git from tests.
+		ResolveDefaultBranch: func(string) string { return "main" },
+		StampWorkMeta:        spy.fn,
 		ReadWorkMeta: func(_ context.Context, _ string, _ []string, id, assignee string) (beads.Bead, error) {
 			meta := map[string]string{}
 			for k, v := range claimedMeta {
@@ -365,5 +368,160 @@ func TestDoHookClaimAdoptionReconcilesDurableStartedFact(t *testing.T) {
 	}
 	if len(emitted) != 1 || emitted[0].ID != "gcg-attempt" || emitted[0].Metadata[beadmeta.SessionIDMetadataKey] != "mc-sess1" {
 		t.Fatalf("started emission = %#v, want durable adopted step", emitted)
+	}
+}
+
+// TestDoHookClaimNeverStampsDefaultBranchOnWorkflowStep is the gc-yllis
+// claim-stamp poisoning regression (ascent gcas-o6sgbw): a workflow step bead
+// (gc.root_bead_id set) claimed by a session whose checkout is parked on the
+// rig's DEFAULT branch must NOT get gc.work_branch=main stamped — the step's
+// real work branch lives elsewhere (dedicated worktree) or does not exist yet.
+// The session back-reference is still stamped; only the poison branch key is
+// withheld.
+func TestDoHookClaimNeverStampsDefaultBranchOnWorkflowStep(t *testing.T) {
+	spy := &stampMetaSpy{}
+	ops := poolClaimOps(
+		`[{"id":"gcas-o6sgbw","status":"open","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"gcas-d3kj0v","gc.step_id":"publish"}}]`,
+		map[string]string{
+			"gc.routed_to":                 "worker",
+			beadmeta.RootBeadIDMetadataKey: "gcas-d3kj0v",
+			beadmeta.StepIDMetadataKey:     "publish",
+		},
+		"main", // checkout HEAD == default branch: the poison value
+		spy,
+	)
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", poolClaimOpts(), ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	want := map[string]string{
+		beadmeta.SessionIDMetadataKey:   "mc-sess1",
+		beadmeta.SessionNameMetadataKey: "gc__role-mc-sess1",
+	}
+	if spy.calls != 1 || !reflect.DeepEqual(spy.patch, want) {
+		t.Fatalf("stamp = {calls:%d patch:%v}, want {1 %v} (no gc.work_branch=default on a workflow step)", spy.calls, spy.patch, want)
+	}
+}
+
+// TestDoHookClaimStampsWorkBranchOnWorkflowStepFromWorktree pins the correct
+// lane the guard must preserve: a workflow step claimed from a dedicated
+// worktree already on its work branch still gets that branch stamped.
+func TestDoHookClaimStampsWorkBranchOnWorkflowStepFromWorktree(t *testing.T) {
+	spy := &stampMetaSpy{}
+	ops := poolClaimOps(
+		`[{"id":"gcas-step","status":"open","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"gcas-root","gc.step_id":"implement"}}]`,
+		map[string]string{
+			"gc.routed_to":                 "worker",
+			beadmeta.RootBeadIDMetadataKey: "gcas-root",
+			beadmeta.StepIDMetadataKey:     "implement",
+		},
+		"fix/browser-mode-ci-flake-audit-gcas-5iw0ey",
+		spy,
+	)
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", poolClaimOpts(), ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	want := map[string]string{
+		beadmeta.WorkBranchMetadataKey:  "fix/browser-mode-ci-flake-audit-gcas-5iw0ey",
+		beadmeta.SessionIDMetadataKey:   "mc-sess1",
+		beadmeta.SessionNameMetadataKey: "gc__role-mc-sess1",
+	}
+	if spy.calls != 1 || !reflect.DeepEqual(spy.patch, want) {
+		t.Fatalf("stamp = {calls:%d patch:%v}, want {1 %v}", spy.calls, spy.patch, want)
+	}
+}
+
+// TestDoHookClaimNeverDowngradesWorkBranchToDefault pins the second poisoning
+// lane (gc-yllis): a bead already carrying a real work-branch stamp, re-visited
+// on a later adoption tick from a checkout back on the default branch, must
+// keep its stamp — the re-stamp tracks a worker moving ONTO its work branch,
+// never "back" onto the default. With session identity already current, no
+// write is issued at all.
+func TestDoHookClaimNeverDowngradesWorkBranchToDefault(t *testing.T) {
+	spy := &stampMetaSpy{}
+	current := map[string]string{
+		"gc.routed_to":    "worker",
+		"gc.work_branch":  "fix/real-work-branch",
+		"gc.session_id":   "mc-sess1",
+		"gc.session_name": "gc__role-mc-sess1",
+	}
+	ops := poolClaimOps(
+		`[{"id":"hw-keep","status":"open","metadata":{"gc.routed_to":"worker","gc.work_branch":"fix/real-work-branch","gc.session_id":"mc-sess1","gc.session_name":"gc__role-mc-sess1"}}]`,
+		current,
+		"main", // checkout reset to the default branch after the work
+		spy,
+	)
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", poolClaimOpts(), ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if spy.calls != 0 {
+		t.Fatalf("StampWorkMeta calls = %d (patch %v), want 0 (never downgrade gc.work_branch to the default branch)", spy.calls, spy.patch)
+	}
+}
+
+// TestDoHookClaimRepairsPoisonedDefaultBranchStamp: a step bead that was
+// poisoned with the default branch before the guard existed is REPAIRED by a
+// later adoption tick from the real work branch — overwriting toward a
+// non-default branch stays allowed.
+func TestDoHookClaimRepairsPoisonedDefaultBranchStamp(t *testing.T) {
+	spy := &stampMetaSpy{}
+	current := map[string]string{
+		"gc.routed_to":                 "worker",
+		beadmeta.RootBeadIDMetadataKey: "gcas-root",
+		"gc.work_branch":               "main", // pre-guard poison
+		"gc.session_id":                "mc-sess1",
+		"gc.session_name":              "gc__role-mc-sess1",
+	}
+	ops := poolClaimOps(
+		`[{"id":"hw-repair","status":"open","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"gcas-root","gc.work_branch":"main","gc.session_id":"mc-sess1","gc.session_name":"gc__role-mc-sess1"}}]`,
+		current,
+		"fix/real-work-branch",
+		spy,
+	)
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", poolClaimOpts(), ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	want := map[string]string{beadmeta.WorkBranchMetadataKey: "fix/real-work-branch"}
+	if spy.calls != 1 || !reflect.DeepEqual(spy.patch, want) {
+		t.Fatalf("stamp = {calls:%d patch:%v}, want {1 %v} (poisoned default stamp repaired)", spy.calls, spy.patch, want)
+	}
+}
+
+// TestDoHookClaimStampsDefaultBranchOnPlainBeadFirstStamp pins the preserved
+// pre-guard behavior: a plain (non-step) bead's FIRST stamp is allowed even
+// when the checkout sits on the default branch — direct-on-default solo work
+// is legitimate — and the guard must not consult the default-branch resolver
+// on that path.
+func TestDoHookClaimStampsDefaultBranchOnPlainBeadFirstStamp(t *testing.T) {
+	spy := &stampMetaSpy{}
+	ops := poolClaimOps(
+		`[{"id":"hw-solo","status":"open","metadata":{"gc.routed_to":"worker"}}]`,
+		map[string]string{"gc.routed_to": "worker"},
+		"main",
+		spy,
+	)
+	ops.ResolveDefaultBranch = func(string) string {
+		t.Error("ResolveDefaultBranch must not be consulted for a plain bead's first stamp")
+		return "main"
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", poolClaimOpts(), ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	want := map[string]string{
+		beadmeta.WorkBranchMetadataKey:  "main",
+		beadmeta.SessionIDMetadataKey:   "mc-sess1",
+		beadmeta.SessionNameMetadataKey: "gc__role-mc-sess1",
+	}
+	if spy.calls != 1 || !reflect.DeepEqual(spy.patch, want) {
+		t.Fatalf("stamp = {calls:%d patch:%v}, want {1 %v}", spy.calls, spy.patch, want)
 	}
 }

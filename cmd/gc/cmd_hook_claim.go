@@ -157,6 +157,12 @@ type hookClaimOps struct {
 	// repo / detached HEAD) omits the branch key — the session back-reference is
 	// still stamped.
 	ResolveWorkBranch hookResolveWorkBranchFunc
+	// ResolveDefaultBranch returns the default/mainline branch of the worker's
+	// checkout (dir). It is consulted only by the work-branch stamp guard
+	// (hookClaimWorkBranchStampAllowed, gc-yllis) and only when the resolved
+	// HEAD would change an existing stamp or stamp a workflow step, so the
+	// common paths never pay for it. Empty result disables the guard.
+	ResolveDefaultBranch hookResolveWorkBranchFunc
 	// StampWorkMeta writes the claim-time execution-identity metadata patch
 	// (gc.work_branch and/or the durable session back-reference gc.session_id /
 	// gc.session_name) onto the claimed bead in ONE update. Best-effort.
@@ -349,6 +355,9 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.ResolveWorkBranch == nil {
 		ops.ResolveWorkBranch = hookResolveWorkBranch
+	}
+	if ops.ResolveDefaultBranch == nil {
+		ops.ResolveDefaultBranch = defaultBranchFor
 	}
 	if ops.StampWorkMeta == nil {
 		ops.StampWorkMeta = hookStampWorkMetaWithBdStore
@@ -1125,7 +1134,9 @@ func hookClaimLifecycleCandidate(bead beads.Bead, opts hookClaimOptions) bool {
 
 // hookClaimIdentityPatch builds the compare-and-skipped claim-time metadata patch.
 // It carries gc.work_branch when the worktree resolves a branch that differs from
-// the bead's, and the session back-reference gc.session_id / gc.session_name when
+// the bead's AND the stamp guard allows it (hookClaimWorkBranchStampAllowed —
+// the default branch is never stamped onto a workflow step and never replaces an
+// existing stamp, gc-yllis), and the session back-reference gc.session_id / gc.session_name when
 // this is a session-run claim (GC_SESSION_ID present) of a non-control bead and the
 // values differ. Session identity is stamped even when the branch is empty — a
 // session with no worktree still needs its back-reference — but never on control
@@ -1136,7 +1147,8 @@ func hookClaimLifecycleCandidate(bead beads.Bead, opts hookClaimOptions) bool {
 func hookClaimIdentityPatch(bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string) map[string]string {
 	patch := map[string]string{}
 	if branch := strings.TrimSpace(ops.ResolveWorkBranch(dir)); branch != "" &&
-		strings.TrimSpace(bead.Metadata[beadmeta.WorkBranchMetadataKey]) != branch {
+		strings.TrimSpace(bead.Metadata[beadmeta.WorkBranchMetadataKey]) != branch &&
+		hookClaimWorkBranchStampAllowed(bead, branch, dir, ops.ResolveDefaultBranch) {
 		patch[beadmeta.WorkBranchMetadataKey] = branch
 	}
 	if sessionID := hookClaimSessionID(opts.Env); sessionID != "" &&
@@ -1150,6 +1162,51 @@ func hookClaimIdentityPatch(bead beads.Bead, opts hookClaimOptions, ops hookClai
 		}
 	}
 	return patch
+}
+
+// hookClaimWorkBranchStampAllowed refuses the two claim-stamp poisoning lanes
+// (gc-yllis): writing the repo's DEFAULT branch into gc.work_branch when that
+// value cannot be the work.
+//
+// The claim hook resolves the stamp from the claiming session's checkout HEAD
+// (ResolveWorkBranch) and re-evaluates it on every adoption tick. Two lanes
+// turn that into poison:
+//
+//   - A workflow step bead (gc.root_bead_id set) claimed from a checkout
+//     parked on the default branch. The step's real work branch either lives
+//     in a dedicated worktree or does not exist yet at claim time, so a
+//     default-branch HEAD is the checkout's parked state, not the work. The
+//     stamp is deferred instead: a later adoption tick (after the worker moves
+//     onto the work branch) or the worker's close-time --set-metadata supplies
+//     the real branch. An absent stamp is recoverable; a poisoned one fails
+//     every commit-reachable-on-branch check forever (ascent gcas-o6sgbw: a
+//     build-from-plan publish step stamped gc.work_branch=main while its
+//     implementation commit lived only on fix/browser-mode-ci-flake-audit-*).
+//   - ANY bead already carrying a non-empty stamp, re-visited from a checkout
+//     back on the default branch (work finished, checkout reset/reused). The
+//     adoption-tick re-stamp exists to track a worker moving ONTO its work
+//     branch — including repairing an earlier default-branch poison — never
+//     "back" onto the default.
+//
+// A FIRST stamp on a plain (non-step) bead is always allowed even when HEAD is
+// the default branch — direct-on-default solo work is legitimate — and an
+// unresolvable default branch disables the guard rather than the stamp, which
+// is exactly the pre-guard behavior. The caller has already established that
+// branch is non-empty and differs from the bead's current stamp.
+func hookClaimWorkBranchStampAllowed(bead beads.Bead, branch, dir string, resolveDefault hookResolveWorkBranchFunc) bool {
+	existing := strings.TrimSpace(bead.Metadata[beadmeta.WorkBranchMetadataKey])
+	isStep := strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey]) != ""
+	if existing == "" && !isStep {
+		return true // plain bead, first stamp: pre-guard behavior, no git call
+	}
+	if resolveDefault == nil {
+		return true
+	}
+	def := strings.TrimSpace(resolveDefault(dir))
+	if def == "" {
+		return true
+	}
+	return branch != def
 }
 
 func hookStampWorkMetaWithBdStore(_ context.Context, dir string, env []string, beadID, assignee string, patch map[string]string) error {
