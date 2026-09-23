@@ -67,3 +67,57 @@ gain_drift_is_additive_only() {
   [ "$_gd_seen" = "1" ] || return 1
   return 0
 }
+
+# diff_has_no_removed_rows <db> <from_head> <to_head> <table>
+# Returns 0 iff the table's <from>..<to> content diff contains zero `removed`
+# rows. Unlike diff_is_additive_only, `modified` rows are allowed: a same-count
+# concurrent UPDATE (a bd writer changing an issue's status while the flatten
+# runs) legitimately rewrites row values in place without deleting anything.
+# A delete+insert pair that merely preserves the row COUNT still surfaces its
+# deletion as a `removed` diff row and fails here. Fails closed on a missing
+# commit endpoint, a missing/invalid table name, or a failed/empty/non-numeric
+# probe result.
+diff_has_no_removed_rows() {
+  _dr_db="$1"
+  _dr_from="$2"
+  _dr_to="$3"
+  _dr_t="$4"
+  # Without both commit endpoints there is nothing to diff against — fail closed.
+  [ -n "$_dr_from" ] && [ -n "$_dr_to" ] && [ -n "$_dr_t" ] || return 1
+  valid_table_name "$_dr_t" || return 1
+  if ! _dr_removed=$(query_single_cell "$_dr_db" \
+    "preservation diff probe failed for table=$_dr_t" \
+    "SELECT COUNT(*) FROM DOLT_DIFF('$_dr_from', '$_dr_to', '$_dr_t') WHERE diff_type = 'removed'"); then
+    return 1
+  fi
+  case "$_dr_removed" in
+    0) return 0 ;;             # zero removed rows — every <from> row still exists at <to>
+    ''|*[!0-9]*) return 1 ;;   # empty/non-numeric probe result — fail closed
+    *) return 1 ;;             # one or more removed rows — row loss, not preservable
+  esac
+}
+
+# same_count_drift_has_no_removals <db> <from_head> <to_head> <space-separated tables>
+# Returns 0 iff every listed same-count hash-drifted table's <from>..<to> diff
+# contains zero `removed` rows — the direct per-row proof that every pre-flight
+# row still exists at <to> (the manual forensic an operator runs before
+# clearing a quarantine marker). Companion to gain_drift_is_additive_only for
+# the hot-DB mixed race (gastownhall/gascity#2846 follow-up, #6245): a single
+# writer transaction INSERTs an events row (gain+drift) AND UPDATEs an issues
+# row (same-count drift), so the same-count table must be provable without
+# requiring an additive-only diff. Returns non-zero (fail closed) if the table
+# list is empty or any table fails diff_has_no_removed_rows.
+same_count_drift_has_no_removals() {
+  _sc_db="$1"
+  _sc_from="$2"
+  _sc_to="$3"
+  _sc_tables="$4"
+  _sc_seen=0
+  for _sc_t in $_sc_tables; do
+    _sc_seen=1
+    diff_has_no_removed_rows "$_sc_db" "$_sc_from" "$_sc_to" "$_sc_t" || return 1
+  done
+  # An empty table list is not a proof of preservation.
+  [ "$_sc_seen" = "1" ] || return 1
+  return 0
+}

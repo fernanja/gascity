@@ -1106,6 +1106,7 @@ verify_counts() {
   verify_counts_saw_row_decrease=0
   verify_counts_saw_decrease_hash_drift=0
   verify_counts_saw_same_count_hash_drift=0
+  verify_counts_same_count_drift_tables=""
   verify_counts_saw_table_list_change=0
   verify_counts_saw_probe_failure=0
   verify_counts_failure_reason=""
@@ -1204,6 +1205,7 @@ verify_counts() {
         printf 'compact: db=%s table=%s value hash changed after flatten without row-count increase before=%s after=%s — quarantine and investigate before GC\n' \
           "$db" "$t" "$expected_hash" "$actual_hash" >&2
         verify_counts_saw_same_count_hash_drift=1
+        verify_counts_same_count_drift_tables="$verify_counts_same_count_drift_tables $t"
         if [ "$fail" -ne 1 ]; then
           fail=1
           verify_counts_failure_reason="post-flatten table value hash changed without row-count increase"
@@ -2099,6 +2101,7 @@ flatten_database() {
   verify_counts_saw_row_decrease=0
   verify_counts_saw_decrease_hash_drift=0
   verify_counts_saw_same_count_hash_drift=0
+  verify_counts_same_count_drift_tables=""
   verify_counts_saw_table_list_change=0
   verify_counts_saw_probe_failure=0
   verify_counts_failure_reason=""
@@ -2576,15 +2579,46 @@ flatten_database() {
   if [ "$verify_counts_rc" -ne 0 ]; then
     integrity_reason="${verify_counts_failure_reason:-post-flatten integrity check failed}"
     integrity_guidance="${verify_counts_failure_guidance:-post-flatten integrity check failed; investigate before re-running}"
+    # Same-count hash drift normally blocks every defer path: with no row-count
+    # change, the drift could in principle be silent row rewriting. But the
+    # ROUTINE hot-DB race (gc-pnf4e; gastownhall/gascity#6245) is a single
+    # writer transaction that INSERTs an events row (gain+drift) AND UPDATEs an
+    # issues row (same-count drift) in the flatten window — so requiring "no
+    # same-count drift" disables both gain+drift defer gates on exactly the
+    # busy databases they exist to protect, and the benign race is permanently
+    # quarantined (observed twice on HQ `ga`, 2026-09-18 and 2026-09-23).
+    # Prove the same-count tables directly instead: a DOLT_DIFF(pre-flight
+    # snapshot, flatten commit) containing zero `removed` rows shows every
+    # pre-flight row still exists (an in-place UPDATE surfaces as `modified`;
+    # a delete+insert pair that preserves the count still surfaces `removed`)
+    # — the same forensic proof an operator runs by hand before clearing a
+    # marker. Only attempted in the ambiguous gain+drift shape; any removed
+    # row, probe failure, or additional anomaly leaves the flag 0 and the
+    # quarantine below fires unchanged.
+    same_count_drift_preserved=1
+    if [ "${verify_counts_saw_same_count_hash_drift:-0}" = "1" ]; then
+      same_count_drift_preserved=0
+      if [ "${verify_counts_saw_gain:-0}" = "1" ] && \
+         [ "${verify_counts_saw_gain_hash_drift:-0}" = "1" ] && \
+         [ "${verify_counts_saw_row_decrease:-0}" != "1" ] && \
+         [ "${verify_counts_saw_table_list_change:-0}" != "1" ] && \
+         [ "${verify_counts_saw_probe_failure:-0}" != "1" ] && \
+         same_count_drift_has_no_removals "$db" "$head" "$flatten_head" "$verify_counts_same_count_drift_tables"; then
+        same_count_drift_preserved=1
+        printf 'compact: db=%s same-count hash drift on table(s) [%s] proven removal-free via DOLT_DIFF(%s..%s) — concurrent-writer UPDATE, not row loss\n' \
+          "$db" "${verify_counts_same_count_drift_tables# }" "$head" "$flatten_head" >&2
+      fi
+    fi
     # Downgrade quarantine -> defer ONLY for the ambiguous gain+drift case when
     # a concurrent writer is proven. Every other integrity failure (row-count
-    # decrease, same-count hash drift, table-list drift, probe failure) and the
-    # gain+drift case with a stable HEAD still quarantine below unchanged.
+    # decrease, unproven same-count hash drift, table-list drift, probe
+    # failure) and the gain+drift case with a stable HEAD still quarantine
+    # below unchanged.
     if [ "$writer_race_detected" = "1" ] && \
        [ "${verify_counts_saw_gain:-0}" = "1" ] && \
        [ "${verify_counts_saw_gain_hash_drift:-0}" = "1" ] && \
        [ "${verify_counts_saw_row_decrease:-0}" != "1" ] && \
-       [ "${verify_counts_saw_same_count_hash_drift:-0}" != "1" ] && \
+       [ "$same_count_drift_preserved" = "1" ] && \
        [ "${verify_counts_saw_table_list_change:-0}" != "1" ] && \
        [ "${verify_counts_saw_probe_failure:-0}" != "1" ]; then
       printf 'compact: db=%s writer race detected during flatten (snapshot_HEAD=%s pre_reset_HEAD=%s flatten_HEAD=%s post_verify_HEAD=%s) — table value hash drift with row-count increase is concurrent-writer data, not corruption; deferring, will retry next run\n' \
@@ -2610,7 +2644,7 @@ flatten_database() {
     if [ "${verify_counts_saw_gain:-0}" = "1" ] && \
        [ "${verify_counts_saw_gain_hash_drift:-0}" = "1" ] && \
        [ "${verify_counts_saw_row_decrease:-0}" != "1" ] && \
-       [ "${verify_counts_saw_same_count_hash_drift:-0}" != "1" ] && \
+       [ "$same_count_drift_preserved" = "1" ] && \
        [ "${verify_counts_saw_table_list_change:-0}" != "1" ] && \
        [ "${verify_counts_saw_probe_failure:-0}" != "1" ] && \
        gain_drift_is_additive_only "$db" "$head" "$flatten_head" "$verify_counts_gain_drift_tables"; then

@@ -25,10 +25,23 @@ query_single_cell() {
     printf ''
     return 0
   fi
-  case "$_t" in
-    issues) printf '%s' "${stub_count_issues:-0}" ;;
-    mail) printf '%s' "${stub_count_mail:-0}" ;;
-    *) printf '0' ;;
+  case "$3" in
+    *"diff_type = 'removed'"*)
+      # removal-only probe (diff_has_no_removed_rows)
+      case "$_t" in
+        issues) printf '%s' "${stub_removed_issues:-0}" ;;
+        mail) printf '%s' "${stub_removed_mail:-0}" ;;
+        *) printf '0' ;;
+      esac
+      ;;
+    *)
+      # non-added probe (diff_is_additive_only)
+      case "$_t" in
+        issues) printf '%s' "${stub_count_issues:-0}" ;;
+        mail) printf '%s' "${stub_count_mail:-0}" ;;
+        *) printf '0' ;;
+      esac
+      ;;
   esac
   return 0
 }
@@ -49,7 +62,8 @@ ok() { pass=$((pass + 1)); printf 'ok   - %s\n' "$1"; }
 no() { fail=$((fail + 1)); printf 'FAIL - %s\n' "$1"; }
 reset() {
   unset STUB_FAIL_TABLE STUB_EMPTY_TABLE STUB_INVALID_TABLE \
-    stub_count_issues stub_count_mail 2>/dev/null || true
+    stub_count_issues stub_count_mail \
+    stub_removed_issues stub_removed_mail 2>/dev/null || true
 }
 
 # 1. single table, purely additive -> preserved (defer)
@@ -91,6 +105,44 @@ if gain_drift_is_additive_only db H1 "" "issues"; then no "missing to-head -> qu
 # 10. invalid table name -> fail closed
 reset; stub_count_issues=0; STUB_INVALID_TABLE=issues
 if gain_drift_is_additive_only db H1 H2 "issues"; then no "invalid table name -> quarantine"; else ok "invalid table name -> quarantine"; fi
+
+# --- same_count_drift_has_no_removals (hot-DB mixed race, gc-pnf4e / #6245) --
+
+# 11. same-count table, zero removed rows -> preserved (defer)
+reset; stub_removed_issues=0
+if same_count_drift_has_no_removals db H1 H2 "issues"; then ok "same-count zero removed -> defer"; else no "same-count zero removed -> defer"; fi
+
+# 12. modified-only drift (non-added count > 0, removed = 0) -> still preserved
+reset; stub_count_issues=2; stub_removed_issues=0
+if same_count_drift_has_no_removals db H1 H2 "issues"; then ok "modified-only same-count drift -> defer"; else no "modified-only same-count drift -> defer"; fi
+
+# 13. same-count table with removed rows -> row loss (quarantine)
+reset; stub_removed_issues=1
+if same_count_drift_has_no_removals db H1 H2 "issues"; then no "same-count removed rows -> quarantine"; else ok "same-count removed rows -> quarantine"; fi
+
+# 14. two tables, one with removed rows -> row loss (quarantine)
+reset; stub_removed_issues=0; stub_removed_mail=3
+if same_count_drift_has_no_removals db H1 H2 "issues mail"; then no "mixed same-count tables -> quarantine"; else ok "mixed same-count tables -> quarantine"; fi
+
+# 15. diff probe failure -> fail closed
+reset; STUB_FAIL_TABLE=issues
+if same_count_drift_has_no_removals db H1 H2 "issues"; then no "same-count probe failure -> quarantine"; else ok "same-count probe failure -> quarantine"; fi
+
+# 16. empty probe result -> fail closed
+reset; STUB_EMPTY_TABLE=issues
+if same_count_drift_has_no_removals db H1 H2 "issues"; then no "same-count empty probe -> quarantine"; else ok "same-count empty probe -> quarantine"; fi
+
+# 17. empty table list -> not a proof
+reset
+if same_count_drift_has_no_removals db H1 H2 ""; then no "same-count empty list -> quarantine"; else ok "same-count empty list -> quarantine"; fi
+
+# 18. missing from-head -> fail closed
+reset; stub_removed_issues=0
+if same_count_drift_has_no_removals db "" H2 "issues"; then no "same-count missing from-head -> quarantine"; else ok "same-count missing from-head -> quarantine"; fi
+
+# 19. invalid table name -> fail closed
+reset; stub_removed_issues=0; STUB_INVALID_TABLE=issues
+if same_count_drift_has_no_removals db H1 H2 "issues"; then no "same-count invalid table -> quarantine"; else ok "same-count invalid table -> quarantine"; fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
