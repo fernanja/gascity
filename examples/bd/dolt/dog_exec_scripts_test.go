@@ -602,7 +602,7 @@ case "$query" in
     # probe, which reports writercommit so HEAD has moved past the flatten's own
     # commit. verify_counts still sees compactcommit (gain+drift) because it does
     # not probe HEAD and the "$(current_head)" gates read the real state.
-    if { [ "$mode" = "writer_race_during_verify" ] || [ "$mode" = "writer_race_db_hash_during_verify" ] || [ "$mode" = "writer_race_with_mixed_same_count_hash_drift" ] || [ "$mode" = "row_count_decreases_with_writer_race" ]; } && [ "$(current_head)" = "compactcommit" ]; then
+    if { [ "$mode" = "writer_race_during_verify" ] || [ "$mode" = "writer_race_db_hash_during_verify" ] || [ "$mode" = "writer_race_with_mixed_same_count_hash_drift" ] || [ "$mode" = "writer_race_with_mixed_same_count_row_removal" ] || [ "$mode" = "row_count_decreases_with_writer_race" ]; } && [ "$(current_head)" = "compactcommit" ]; then
       calls_file="$state_file.postverify-head-calls"
       calls=0
       if [ -f "$calls_file" ]; then
@@ -660,7 +660,7 @@ case "$query" in
       print_cell ""
       exit 0
     fi
-    if { [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ] || [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "writer_race_before_flatten" ] || [ "$mode" = "remote_writer_race_before_flatten" ] || [ "$mode" = "writer_race_during_verify" ] || [ "$mode" = "writer_race_with_mixed_same_count_hash_drift" ] || [ "$mode" = "row_count_decreases_with_writer_race" ] || [ "$mode" = "row_count_decreases_with_hash_change" ]; } && [ "$(current_head)" = "compactcommit" ]; then
+    if { [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ] || [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "mixed_gain_and_same_count_row_removal" ] || [ "$mode" = "writer_race_before_flatten" ] || [ "$mode" = "remote_writer_race_before_flatten" ] || [ "$mode" = "writer_race_during_verify" ] || [ "$mode" = "writer_race_with_mixed_same_count_hash_drift" ] || [ "$mode" = "writer_race_with_mixed_same_count_row_removal" ] || [ "$mode" = "row_count_decreases_with_writer_race" ] || [ "$mode" = "row_count_decreases_with_hash_change" ]; } && [ "$(current_head)" = "compactcommit" ]; then
       print_cell hash-beads-after-writer
       exit 0
     fi
@@ -672,7 +672,7 @@ case "$query" in
     exit 0
     ;;
   *"DOLT_HASHOF_TABLE('notes')"*)
-    if { [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "writer_race_with_mixed_same_count_hash_drift" ] || [ "$mode" = "same_count_hash_drift_then_probe_failure" ] || [ "$mode" = "probe_failure_then_same_count_hash_drift" ]; } && [ "$(current_head)" = "compactcommit" ]; then
+    if { [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "mixed_gain_and_same_count_row_removal" ] || [ "$mode" = "writer_race_with_mixed_same_count_hash_drift" ] || [ "$mode" = "writer_race_with_mixed_same_count_row_removal" ] || [ "$mode" = "same_count_hash_drift_then_probe_failure" ] || [ "$mode" = "probe_failure_then_same_count_hash_drift" ]; } && [ "$(current_head)" = "compactcommit" ]; then
       print_cell hash-notes-after-writer
       exit 0
     fi
@@ -708,7 +708,7 @@ case "$query" in
       print_cell blocked_issues
       exit 0
     fi
-    if [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "writer_race_with_mixed_same_count_hash_drift" ]; then
+    if [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "mixed_gain_and_same_count_row_removal" ] || [ "$mode" = "writer_race_with_mixed_same_count_hash_drift" ] || [ "$mode" = "writer_race_with_mixed_same_count_row_removal" ]; then
       print_cells beads notes
       exit 0
     fi
@@ -721,6 +721,38 @@ case "$query" in
       exit 0
     fi
     print_cell beads
+    exit 0
+    ;;
+  *"DOLT_DIFF("*"'beads')"*)
+    # Option A additive-only preservation probe on the gained table
+    # (diff_type <> 'added' count; 0 = purely additive). Must precede the
+    # bare COUNT arms below or they swallow the DOLT_DIFF COUNT query.
+    case "$mode" in
+      mixed_row_count_gain_and_same_count_hash_drift|mixed_gain_and_same_count_row_removal)
+        print_cell 0
+        ;;
+      *)
+        printf 'unexpected DOLT_DIFF query: %%s\n' "$query" >&2
+        exit 64
+        ;;
+    esac
+    exit 0
+    ;;
+  *"DOLT_DIFF("*"'notes')"*)
+    # Same-count removal-free preservation probe on the drifted table
+    # (diff_type = 'removed' count; 0 = every pre-flight row still exists).
+    case "$mode" in
+      mixed_row_count_gain_and_same_count_hash_drift|writer_race_with_mixed_same_count_hash_drift)
+        print_cell 0
+        ;;
+      mixed_gain_and_same_count_row_removal|writer_race_with_mixed_same_count_row_removal)
+        print_cell 1
+        ;;
+      *)
+        printf 'unexpected DOLT_DIFF query: %%s\n' "$query" >&2
+        exit 64
+        ;;
+    esac
     exit 0
     ;;
   *"SELECT COUNT(*) FROM"*"blocked_issues"*)
@@ -752,7 +784,7 @@ case "$query" in
       printf 'row count exploded after flatten\n' >&2
       exit 47
     fi
-    if { [ "$mode" = "row_count_gain_with_stable_hashes" ] || [ "$mode" = "row_count_gain_with_db_hash_drift" ] || [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ] || [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "writer_race_before_flatten" ] || [ "$mode" = "remote_writer_race_before_flatten" ] || [ "$mode" = "writer_race_during_verify" ] || [ "$mode" = "writer_race_db_hash_during_verify" ] || [ "$mode" = "writer_race_with_mixed_same_count_hash_drift" ]; } && [ "$calls" -gt 1 ]; then
+    if { [ "$mode" = "row_count_gain_with_stable_hashes" ] || [ "$mode" = "row_count_gain_with_db_hash_drift" ] || [ "$mode" = "row_count_and_hash_diverges" ] || [ "$mode" = "same_table_replacement_with_row_gain" ] || [ "$mode" = "mixed_row_count_gain_and_same_count_hash_drift" ] || [ "$mode" = "mixed_gain_and_same_count_row_removal" ] || [ "$mode" = "writer_race_before_flatten" ] || [ "$mode" = "remote_writer_race_before_flatten" ] || [ "$mode" = "writer_race_during_verify" ] || [ "$mode" = "writer_race_db_hash_during_verify" ] || [ "$mode" = "writer_race_with_mixed_same_count_hash_drift" ] || [ "$mode" = "writer_race_with_mixed_same_count_row_removal" ]; } && [ "$calls" -gt 1 ]; then
       print_cell 11
     elif { [ "$mode" = "row_count_decreases" ] || [ "$mode" = "row_count_decreases_with_writer_race" ] || [ "$mode" = "row_count_decreases_with_hash_change" ]; } && [ "$calls" -gt 1 ]; then
       print_cell 9
@@ -1951,63 +1983,117 @@ func TestCompactScriptQuarantinesSameTableRowGainWithValueHashDriftBeforeFullGC(
 	}
 }
 
-func TestCompactScriptQuarantinesMixedRowGainAndSameCountHashDriftBeforeFullGC(t *testing.T) {
+// The routine hot-DB race (gc-pnf4e; #6245): one concurrent writer transaction
+// INSERTs into one table (gain+drift on beads) and UPDATEs a row in another
+// (same-count hash drift on notes) inside the flatten window, with the writer
+// commit absorbed into the flatten (stable HEAD). When the additive-only proof
+// covers the gained table AND the removal-free proof covers the same-count
+// table, every pre-flight row is proven to survive — defer, don't quarantine.
+func TestCompactScriptDefersMixedGainAndSameCountDriftWhenPreservationProven(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
 	out, err := fixture.run(t, "mixed_row_count_gain_and_same_count_hash_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
-	if err == nil {
-		t.Fatalf("compact succeeded despite mixed row gain and same-count hash drift:\n%s", out)
+	if err != nil {
+		t.Fatalf("proven-preservation mixed drift must defer, not fail: %v\n%s", err, out)
 	}
 	if !strings.Contains(out, "table=beads gained rows during flatten") {
 		t.Fatalf("output missing row-count gain evidence:\n%s", out)
 	}
-	if !strings.Contains(out, "table=notes value hash changed after flatten without row-count increase") {
-		t.Fatalf("output missing same-count hash drift warning:\n%s", out)
+	if !strings.Contains(out, "same-count hash drift on table(s) [notes] proven removal-free") {
+		t.Fatalf("output missing removal-free same-count proof note:\n%s", out)
 	}
-	logData, err := os.ReadFile(fixture.doltLog)
-	if err != nil {
-		t.Fatalf("read dolt log: %v", err)
+	if !strings.Contains(out, "proven additive-only via DOLT_DIFF") ||
+		!strings.Contains(out, "deferring, will retry next run") {
+		t.Fatalf("output missing additive-only defer message:\n%s", out)
+	}
+	quarantine := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if _, statErr := os.Stat(quarantine); !os.IsNotExist(statErr) {
+		t.Fatalf("proven-preservation mixed drift must NOT write a quarantine marker; stat=%v", statErr)
+	}
+	pendingGC := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")
+	if reason := compactMarkerValue(t, pendingGC, "reason"); reason != "writer race during flatten deferred full GC" {
+		t.Fatalf("proven-preservation defer should record pending-GC retry marker, got reason %q", reason)
+	}
+	logData, readErr := os.ReadFile(fixture.doltLog)
+	if readErr != nil {
+		t.Fatalf("read dolt log: %v", readErr)
 	}
 	log := string(logData)
-	if !strings.Contains(log, "DOLT_HASHOF_TABLE('beads')") || !strings.Contains(log, "DOLT_HASHOF_TABLE('notes')") {
-		t.Fatalf("mixed drift test should probe table value hashes:\n%s", log)
+	if !strings.Contains(log, "diff_type = 'removed'") {
+		t.Fatalf("same-count table must be proven via a removed-row diff probe:\n%s", log)
 	}
 	if strings.Contains(log, "DOLT_GC") {
-		t.Fatalf("mixed row gain and same-count hash drift must block full GC:\n%s", log)
-	}
-	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
-	if reason := compactMarkerValue(t, marker, "reason"); reason != "post-flatten table value hash changed with row-count increase" {
-		t.Fatalf("quarantine reason should identify first table hash drift, got %q", reason)
+		t.Fatalf("preservation-proven defer must still skip GC this run:\n%s", log)
 	}
 }
 
-func TestCompactScriptQuarantinesMixedSignalsDespiteWriterRace(t *testing.T) {
+// Control: identical mixed signals, but the same-count table's diff shows a
+// removed row (a delete+insert masquerading as an in-place update, or genuine
+// row loss). The removal-free proof fails closed and the quarantine fires
+// exactly as before the gc-pnf4e fix.
+func TestCompactScriptQuarantinesMixedGainWhenSameCountTableLostRows(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
-	out, err := fixture.run(t, "writer_race_with_mixed_same_count_hash_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	out, err := fixture.run(t, "mixed_gain_and_same_count_row_removal", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
 	if err == nil {
-		t.Fatalf("compact succeeded despite proven writer plus same-count hash drift:\n%s", out)
+		t.Fatalf("compact succeeded despite removed rows in same-count drifted table:\n%s", out)
 	}
-	if !strings.Contains(out, "writer race detected") {
-		t.Fatalf("output missing proven writer evidence:\n%s", out)
+	if strings.Contains(out, "proven removal-free") {
+		t.Fatalf("removal-free note must not appear when the diff shows removed rows:\n%s", out)
 	}
-	if !strings.Contains(out, "table=beads gained rows during flatten") ||
-		!strings.Contains(out, "table=notes value hash changed after flatten without row-count increase") {
-		t.Fatalf("output missing mixed integrity signals:\n%s", out)
+	logData, readErr := os.ReadFile(fixture.doltLog)
+	if readErr != nil {
+		t.Fatalf("read dolt log: %v", readErr)
 	}
-	logData, err := os.ReadFile(fixture.doltLog)
-	if err != nil {
-		t.Fatalf("read dolt log: %v", err)
+	if strings.Contains(string(logData), "DOLT_GC") {
+		t.Fatalf("same-count row loss must block full GC:\n%s", string(logData))
 	}
-	log := string(logData)
-	if strings.Contains(log, "DOLT_GC") {
-		t.Fatalf("mixed hard integrity signals must block full GC despite writer race:\n%s", log)
-	}
-	quarantine := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
-	if _, err := os.Stat(quarantine); err != nil {
-		t.Fatalf("mixed hard integrity signals should write quarantine marker: %v", err)
+	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if reason := compactMarkerValue(t, marker, "reason"); reason != "post-flatten table value hash changed with row-count increase" {
+		t.Fatalf("quarantine reason should identify gained-table hash drift, got %q", reason)
 	}
 	pendingGC := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")
-	if _, err := os.Stat(pendingGC); !os.IsNotExist(err) {
-		t.Fatalf("mixed hard integrity signals must not write pending-GC marker; stat=%v", err)
+	if _, statErr := os.Stat(pendingGC); !os.IsNotExist(statErr) {
+		t.Fatalf("same-count row loss must not write pending-GC marker; stat=%v", statErr)
+	}
+}
+
+// The HEAD-proven variant of the mixed race (the exact ga incidents of
+// 2026-09-18/2026-09-23: post-verify HEAD moved past the flatten commit, gain
+// +drift on one table, same-count drift on another). With the same-count table
+// proven removal-free, the writer-race gate defers instead of quarantining.
+func TestCompactScriptDefersWriterRaceMixedSameCountDriftProvenRemovalFree(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "writer_race_with_mixed_same_count_hash_drift", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	assertCompactWriterRaceDeferred(t, fixture, out, err)
+	if !strings.Contains(out, "same-count hash drift on table(s) [notes] proven removal-free") {
+		t.Fatalf("output missing removal-free same-count proof note:\n%s", out)
+	}
+}
+
+// Control: proven writer race cannot launder actual row loss — a removed row
+// in the same-count drifted table still quarantines despite HEAD movement.
+func TestCompactScriptQuarantinesWriterRaceMixedWhenSameCountTableLostRows(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "writer_race_with_mixed_same_count_row_removal", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err == nil {
+		t.Fatalf("compact succeeded despite removed rows under a proven writer race:\n%s", out)
+	}
+	if !strings.Contains(out, "additional integrity failure category prevents defer") {
+		t.Fatalf("output missing blocked-defer explanation:\n%s", out)
+	}
+	logData, readErr := os.ReadFile(fixture.doltLog)
+	if readErr != nil {
+		t.Fatalf("read dolt log: %v", readErr)
+	}
+	if strings.Contains(string(logData), "DOLT_GC") {
+		t.Fatalf("row loss must block full GC despite writer race:\n%s", string(logData))
+	}
+	quarantine := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-quarantine", "beads")
+	if _, statErr := os.Stat(quarantine); statErr != nil {
+		t.Fatalf("row loss under writer race should write quarantine marker: %v", statErr)
+	}
+	pendingGC := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-pending-gc", "beads")
+	if _, statErr := os.Stat(pendingGC); !os.IsNotExist(statErr) {
+		t.Fatalf("row loss under writer race must not write pending-GC marker; stat=%v", statErr)
 	}
 }
 
